@@ -1,0 +1,51 @@
+{
+  "cirr": {
+    "data_dir": "./data/CIRR",
+    "image_base_dir": "./data/CIRR",
+    "captions_file": "./data/CIRR/cirr_captions_train.json",
+    "image_splits_file": "./data/CIRR/cirr_image_splits.json",
+    "eval_file": "./data/CIRR/cirr_captions_test.json",
+    "description": "CIRR dataset for composed image retrieval"
+  },
+  "fashioniq": {
+    "data_dir": "./data/FashionIQ",
+    "image_base_dir": "./data/FashionIQ/images",
+    "categories": ["dress", "shirt", "toptee"],
+    "description": "FashionIQ dataset for fashion image retrieval"
+  },
+  "data_download_instructions": {
+    "cirr": [
+      "1. Download CIRR dataset from: https://github.com/Cuberick-Orion/CIRR",
+      "2. Extract to ./data/CIRR/",
+      "3. Ensure the following structure:",
+      "   ./data/CIRR/",
+      "   ├── cirr_captions_train.json",
+      "   ├── cirr_captions_test.json",
+      "   ├── cirr_image_splits.json",
+      "   └── images/"
+    ],
+    "fashioniq": [
+      "1. Download FashionIQ dataset from: https://github.com/XiaoxiaoGuo/fashion-iq",
+      "2. Extract to ./data/FashionIQ/",
+      "3. Ensure the following structure:",
+      "   ./data/FashionIQ/",
+      "   ├── captions/",
+      "   │   ├── cap.dress.train.json",
+      "   │   ├── cap.shirt.train.json",
+      "   │   └── cap.toptee.train.json",
+      "   └── images/"
+    ]
+  },
+  "foundation_models": {
+    "qwen2_vl": {
+      "model_name": "Qwen/Qwen2-VL-2B-Instruct",
+      "description": "Qwen2-VL 2B model for caption generation",
+      "download_command": "huggingface-cli download Qwen/Qwen2-VL-2B-Instruct"
+    },
+    "llava": {
+      "model_name": "llava-hf/llava-1.5-7b-hf",
+      "description": "LLaVA 1.5 7B model for caption generation",
+      "download_command": "huggingface-cli download llava-hf/llava-1.5-7b-hf"
+    }
+  }
+}
