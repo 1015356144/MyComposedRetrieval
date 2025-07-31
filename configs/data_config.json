@@ -1,0 +1,17 @@
+{
+  "dataset_paths": {
+    "cirr": "/home/guohaiyun/yty_data/CIRR/cirr",
+    "fashioniq": "/home/guohaiyun/yty_data/FashionIQ",
+    "coco": "/home/guohaiyun/yty_data/COCO"
+  },
+  "model_paths": {
+    "qwen2_vl": "/home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-2B-Instruct",
+    "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf"
+  },
+  "default_settings": {
+    "batch_size": 32,
+    "learning_rate": 1e-5,
+    "num_epochs": 5,
+    "max_length": 512
+  }
+}

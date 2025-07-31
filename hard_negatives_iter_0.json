@@ -1,0 +1,18 @@
+[
+  {
+    "query_id": "sample_001",
+    "reference_image": "train-10108-1-img1",
+    "target_image": "train-10108-0-img1", 
+    "caption": "remove the woman and leave only the dog",
+    "similarity_score": 0.95,
+    "iteration": 0
+  },
+  {
+    "query_id": "sample_002",
+    "reference_image": "train-10109-0-img0",
+    "target_image": "train-10109-1-img0",
+    "caption": "change the color to blue",
+    "similarity_score": 0.87,
+    "iteration": 0
+  }
+]
