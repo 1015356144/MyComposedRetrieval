@@ -1,0 +1,29 @@
+# CIRR Dataset Configuration for Iterative Training
+
+CIRR:
+    dataset_parser: IterativeCIRRDataset
+    dataset_name: CIRR  # local CIRR data
+    dataset_split: train
+    data_dir: /home/guohaiyun/yty_data/CIRR/cirr  # local data directory
+    image_base_dir: /home/guohaiyun/yty_data/CIRR  # base directory for images
+    captions_file: /home/guohaiyun/yty_data/CIRR/cirr/captions/cap.rc2.train.json  # captions file
+    image_splits_file: /home/guohaiyun/yty_data/CIRR/cirr/image_splits/split.rc2.train.json  # image paths mapping
+    num_sample_per_subset: 1000  # reduced for testing
+    weight: 1.0
+    
+    # Iterative training specific configs
+    max_iterations: 2  # reduced for testing
+    hard_neg_collection_freq: 1
+    hard_neg_top_k: 10
+    caption_generation_batch_size: 4  # reduced for testing
+    
+    # Fast mode for testing (significantly reduces computation)
+    fast_mode: true
+    fast_mode_max_samples: 100  # Only process 100 samples for hard negatives
+    fast_mode_retrieval_db_size: 50  # Only use 50 images in retrieval database
+    fast_mode_max_steps: 5  # Only train for 5 steps per iteration
+    
+    # Foundation model for caption generation
+    foundation_model_name: "Qwen/Qwen2-VL-2B-Instruct"  # or your preferred foundation model
+    foundation_model_temperature: 0.7
+    foundation_model_max_length: 100
