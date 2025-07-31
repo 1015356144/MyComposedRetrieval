@@ -1,0 +1,29 @@
+# Test Configuration for Quick Development
+
+CIRR:
+    dataset_parser: IterativeCIRRDataset
+    dataset_name: CIRR  # local CIRR data
+    dataset_split: train
+    data_dir: /home/guohaiyun/yty_data/CIRR/cirr
+    image_base_dir: /home/guohaiyun/yty_data/CIRR
+    captions_file: /home/guohaiyun/yty_data/CIRR/cirr/captions/cap.rc2.train.json
+    image_splits_file: /home/guohaiyun/yty_data/CIRR/cirr/image_splits/split.rc2.train.json
+    num_sample_per_subset: 50  # Very small for testing
+    weight: 1.0
+    
+    # Minimal iterative training for testing
+    max_iterations: 2
+    hard_neg_collection_freq: 1
+    hard_neg_top_k: 3
+    caption_generation_batch_size: 2
+    
+    # Ultra fast mode for development
+    fast_mode: true
+    fast_mode_max_samples: 20
+    fast_mode_retrieval_db_size: 10
+    fast_mode_max_steps: 2
+    
+    # Foundation model
+    foundation_model_name: "Qwen/Qwen2-VL-2B-Instruct"
+    foundation_model_temperature: 0.7
+    foundation_model_max_length: 50
