@@ -23,6 +23,11 @@ CIRR:
     fast_mode_retrieval_db_size: 50  # Only use 50 images in retrieval database
     fast_mode_max_steps: 5  # Only train for 5 steps per iteration
     
+    # Production mode settings (uncomment for real training)
+    # fast_mode: false
+    # production_max_steps: 1000  # Steps per iteration in production
+    # production_save_steps: 100  # Save frequency in production
+    
     # Foundation model for caption generation
     foundation_model_name: "Qwen/Qwen2-VL-2B-Instruct"  # or your preferred foundation model
     foundation_model_temperature: 0.7

@@ -331,15 +331,34 @@ def Qwen2_VL_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_len
                         if image.size[0] < 28 or image.size[1] < 28:
                             image = image.resize((56, 56))
                             images[iid] = image
-                    inputs = processor(text=[text], images=images, return_tensors="np", max_length=None, truncation=False, input_data_format=ChannelDimension.LAST)
+                    inputs = processor(
+                        text=[text], 
+                        images=images, 
+                        return_tensors="np", 
+                        max_length=None, 
+                        truncation=False, 
+                        input_data_format=ChannelDimension.LAST,
+                        min_pixels=28*28*4,
+                        max_pixels=28*28*1280  # Set default max_pixels
+                    )
                 elif vlm_video_token in text:
                     # TODO: check text/video data validity
-                    inputs = processor(text=[text], videos=[images], return_tensors="np", max_length=None, truncation=False, input_data_format=ChannelDimension.LAST)
+                    inputs = processor(
+                        text=[text], 
+                        videos=[images], 
+                        return_tensors="np", 
+                        max_length=None, 
+                        truncation=False, 
+                        input_data_format=ChannelDimension.LAST,
+                        min_pixels=28*28*4,
+                        max_pixels=28*28*1280  # Set default max_pixels
+                    )
                 else:
                     raise NotImplementedError(f"No visual token found ({vlm_image_token} or {vlm_video_token}) in the text: {text}")
             except Exception as e:
-                for i in images:
-                    print(i.filename)
+                print(f"Error in Qwen2_VL_process_fn: {e}")
+                for i, img in enumerate(images):
+                    print(f"Image {i}: {type(img)}, size: {getattr(img, 'size', 'unknown')}")
                 raise e
             input_ids.append(inputs["input_ids"].squeeze().tolist())
             if 'pixel_values' in inputs:

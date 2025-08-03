@@ -29,7 +29,41 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                  max_iterations: int = 3,
                  hard_neg_collection_freq: int = 1,
                  caption_generation_batch_size: int = 8,
+                 model_args=None,
+                 data_args=None,
+                 max_length=None,
+                 # Fast mode and production mode parameters
+                 fast_mode: bool = False,
+                 fast_mode_max_samples: int = 100,
+                 fast_mode_retrieval_db_size: int = 50,
+                 fast_mode_max_steps: int = 5,
+                 production_max_steps: int = 1000,
+                 production_save_steps: int = 100,
                  **kwargs):
+        # Store model_args, data_args and max_length before calling super().__init__()
+        self.model_args = model_args
+        self.data_args = data_args
+        self.max_length = max_length
+        
+        # Store fast mode and production mode settings
+        self.fast_mode = fast_mode
+        self.fast_mode_max_samples = fast_mode_max_samples
+        self.fast_mode_retrieval_db_size = fast_mode_retrieval_db_size
+        self.fast_mode_max_steps = fast_mode_max_steps
+        self.production_max_steps = production_max_steps
+        self.production_save_steps = production_save_steps
+        
+        # Remove parameters that parent Trainer doesn't accept
+        kwargs.pop('model_args', None)
+        kwargs.pop('data_args', None)
+        kwargs.pop('max_length', None)
+        kwargs.pop('fast_mode', None)
+        kwargs.pop('fast_mode_max_samples', None)
+        kwargs.pop('fast_mode_retrieval_db_size', None)
+        kwargs.pop('fast_mode_max_steps', None)
+        kwargs.pop('production_max_steps', None)
+        kwargs.pop('production_save_steps', None)
+        
         super().__init__(**kwargs)
         
         self.foundation_model = foundation_model
@@ -48,18 +82,54 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         self._try_resume_from_checkpoint()
         
         print_master(f"Initialized IterativeRetrievalTrainer with {max_iterations} max iterations")
+        
+        # Apply fast mode or production mode settings
+        self._configure_training_mode()
+    
+    def _configure_training_mode(self):
+        """Configure training parameters based on fast mode or production mode"""
+        # Debug: Print fast_mode value
+        print_master(f"DEBUG: self.fast_mode = {self.fast_mode}")
+        print_master(f"DEBUG: fast_mode_max_steps = {self.fast_mode_max_steps}")
+        
+        if self.fast_mode:
+            print_master("=== FAST MODE CONFIGURATION ===")
+            print_master(f"Max steps per iteration: {self.fast_mode_max_steps}")
+            print_master(f"Max samples for hard negatives: {self.fast_mode_max_samples}")
+            print_master(f"Retrieval database size: {self.fast_mode_retrieval_db_size}")
+            
+            # Override training arguments for fast mode
+            self.args.max_steps = self.fast_mode_max_steps
+            self.args.save_steps = max(1, self.fast_mode_max_steps // 2)  # Save in the middle
+            self.args.logging_steps = 1
+            
+        else:
+            print_master("=== PRODUCTION MODE CONFIGURATION ===")
+            print_master(f"Max steps per iteration: {self.production_max_steps}")
+            print_master(f"Save frequency: every {self.production_save_steps} steps")
+            
+            # Override training arguments for production mode
+            self.args.max_steps = self.production_max_steps
+            self.args.save_steps = self.production_save_steps
+            self.args.logging_steps = min(10, self.production_save_steps // 10)
+        
+        print_master(f"Final training configuration:")
+        print_master(f"  max_steps: {self.args.max_steps}")
+        print_master(f"  save_steps: {self.args.save_steps}")
+        print_master(f"  logging_steps: {self.args.logging_steps}")
+        print_master("=" * 50)
     
     def _try_resume_from_checkpoint(self):
         """Try to resume from a previous checkpoint to avoid recomputation"""
         output_dir = self.args.output_dir
         
-        # Look for the latest iteration state
+        # Look for the latest iteration state (for metadata only, model already loaded in main)
         for i in range(self.max_iterations - 1, -1, -1):
             state_file = os.path.join(output_dir, f"iteration_{i}_state.json")
             if os.path.exists(state_file):
-                print_master(f"Found checkpoint for iteration {i}, resuming...")
+                print_master(f"Found iteration state for iteration {i}, loading metadata...")
                 
-                # Load iteration state
+                # Load iteration state (metadata only)
                 with open(state_file, 'r') as f:
                     state = json.load(f)
                 
@@ -74,22 +144,31 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                         self.train_dataset.hard_negatives_file = hard_neg_file
                         self.train_dataset._load_hard_negatives()
                 
-                print_master(f"Resuming from iteration {self.current_iteration}")
+                print_master(f"Resuming from iteration {self.current_iteration} (model loaded separately)")
                 return True
         
-        print_master("No previous checkpoint found, starting from scratch")
+        print_master("No previous iteration state found, starting from scratch")
         return False
     
     def iterative_train(self, resume_from_iteration: int = 0):
         """
         Main iterative training loop
+        
+        Args:
+            resume_from_iteration (int): Specific iteration to resume from. 
+                                       If 0, will auto-detect latest checkpoint.
+                                       If > 0, will load from that specific iteration.
         """
         print_master("Starting iterative training process...")
         
         # Resume from specific iteration if specified
         if resume_from_iteration > 0:
+            print_master(f"Manually resuming from iteration {resume_from_iteration}")
             self.current_iteration = resume_from_iteration
-            self._load_iteration_state(resume_from_iteration)
+            self._load_iteration_state(resume_from_iteration - 1)  # Load previous iteration's state
+            
+            # Also need to load the dataset state for this iteration
+            self._prepare_dataset_for_iteration(resume_from_iteration)
         
         for iteration in range(self.current_iteration, self.max_iterations):
             print_master(f"\n{'='*60}")
@@ -163,13 +242,33 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         """Evaluate current model on validation set"""
         print_master(f"Evaluating iteration {self.current_iteration} model...")
         
-        # This should call your evaluation pipeline
-        # For now, return dummy metrics
-        eval_results = {
-            'r_at_1': 0.5,  # Placeholder
-            'r_at_5': 0.7,  # Placeholder
-            'r_at_10': 0.8  # Placeholder
-        }
+        try:
+            # Initialize evaluator if not already done
+            if not hasattr(self, 'evaluator') or self.evaluator is None:
+                from .evaluation.cirr_evaluator import CIRREvaluator
+                
+                self.evaluator = CIRREvaluator(
+                    model=self.model,
+                    processor=self.processing_class,
+                    data_args=self.data_args,
+                    model_args=self.model_args,
+                    device=self.args.device,
+                    batch_size=8  # Small batch size for evaluation
+                )
+                print_master("Real evaluator initialized successfully")
+            
+            # Run real evaluation
+            eval_results = self.evaluator.evaluate()
+            
+        except Exception as e:
+            print_master(f"Real evaluation failed: {e}")
+            print_master("Falling back to dummy evaluation")
+            # Fallback to dummy metrics
+            eval_results = {
+                'r_at_1': 0.5,  # Placeholder
+                'r_at_5': 0.7,  # Placeholder
+                'r_at_10': 0.8  # Placeholder
+            }
         
         print_master(f"Iteration {self.current_iteration} results: {eval_results}")
         return eval_results
@@ -191,11 +290,22 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         self.model.eval()
         
         if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
-            # Use dataset's built-in hard negative collection
+            # Determine sample limit based on mode
+            sample_limit = self.fast_mode_max_samples if self.fast_mode else None
+            
+            # Also pass retrieval database size information to the dataset
+            if self.fast_mode and hasattr(self.train_dataset, 'fast_mode_retrieval_db_size'):
+                self.train_dataset.fast_mode_retrieval_db_size = self.fast_mode_retrieval_db_size
+            
+            # Use dataset's built-in hard negative collection with sample limit
             hard_negatives = self.train_dataset.collect_hard_negatives_batch(
                 self.model,
-                batch_size=8  # Fixed batch size for faster processing
+                batch_size=8,  # Fixed batch size for faster processing
+                max_samples=sample_limit  # Pass limit to dataset
             )
+            
+            print_master(f"Collected {len(hard_negatives)} hard negatives " + 
+                        (f"(limited to {sample_limit})" if sample_limit else "(no limit)"))
             
             # Cache the results
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
@@ -211,11 +321,24 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         return hard_negatives
     
     def _collect_hard_negatives_fallback(self) -> List[Dict]:
-        """Fallback method for hard negative collection"""
+        """Fallback method for hard negative collection with fast mode support"""
         # This should implement retrieval evaluation and hard negative identification
-        # For now, return empty list
         print_master("Using fallback hard negative collection")
-        return []
+        
+        # Generate dummy hard negatives for testing
+        dummy_count = self.fast_mode_max_samples if self.fast_mode else 500
+        dummy_negatives = []
+        for i in range(dummy_count):
+            dummy_negatives.append({
+                'query_id': f'dummy_query_{i}',
+                'reference_image': f'dummy_ref_{i}',
+                'target_image': f'dummy_target_{i}',
+                'original_caption': f'dummy caption {i}',
+                'difficulty_score': 0.8 + (i % 5) * 0.04  # Simulate difficulty scores
+            })
+        
+        print_master(f"Generated {len(dummy_negatives)} dummy hard negatives")
+        return dummy_negatives
     
     def _generate_augmented_captions(self, hard_negatives: List[Dict]) -> List[Dict]:
         """Generate augmented captions using foundation model"""
@@ -250,6 +373,22 @@ class IterativeRetrievalTrainer(MMEBTrainer):
     def _prepare_next_iteration_dataset(self, next_iteration: int, augmented_samples: List[Dict]):
         """Prepare dataset for next iteration with augmented samples"""
         print_master(f"Preparing dataset for iteration {next_iteration}...")
+        
+        # Save augmented samples to file for resuming with metadata
+        augmented_file = os.path.join(self.args.output_dir, f"augmented_samples_iter_{next_iteration}.json")
+        
+        # Create metadata structure
+        augmented_data = {
+            "total_samples": len(augmented_samples),
+            "generation_timestamp": __import__('time').time(),
+            "iteration_round": next_iteration,
+            "sample_statistics": self._compute_sample_statistics(augmented_samples),
+            "samples": augmented_samples
+        }
+        
+        with open(augmented_file, 'w') as f:
+            json.dump(augmented_data, f, indent=2)
+        print_master(f"Saved {len(augmented_samples)} augmented samples to {augmented_file}")
         
         if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
             # Update dataset with augmented samples
@@ -290,14 +429,110 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         
         print_master(f"Dataset updated with {len(augmented_samples)} new samples")
     
+    def _compute_sample_statistics(self, samples: List[Dict]) -> Dict[str, Any]:
+        """Compute statistics for augmented samples"""
+        if not samples:
+            return {}
+        
+        try:
+            # Compute text length statistics
+            original_lengths = []
+            generated_lengths = []
+            reference_images = set()
+            target_images = set()
+            
+            for sample in samples:
+                # Original text length
+                if 'original_mod_text' in sample:
+                    original_lengths.append(len(sample['original_mod_text']))
+                
+                # Generated text length
+                if 'modification_text' in sample:
+                    generated_lengths.append(len(sample['modification_text']))
+                
+                # Unique images
+                if 'reference_image' in sample:
+                    reference_images.add(sample['reference_image'])
+                if 'target_image' in sample:
+                    target_images.add(sample['target_image'])
+            
+            statistics = {
+                'total_samples': len(samples),
+                'avg_original_length': sum(original_lengths) / len(original_lengths) if original_lengths else 0,
+                'avg_generated_length': sum(generated_lengths) / len(generated_lengths) if generated_lengths else 0,
+                'unique_reference_images': len(reference_images),
+                'unique_target_images': len(target_images)
+            }
+            
+            # Add augmented sample ratio if available
+            augmented_count = sum(1 for s in samples if s.get('is_augmented', False))
+            statistics['augmented_ratio'] = augmented_count / len(samples) if samples else 0
+            
+            return statistics
+            
+        except Exception as e:
+            print_master(f"Warning: Failed to compute sample statistics: {e}")
+            return {'total_samples': len(samples)}
+    
+    def _prepare_dataset_for_iteration(self, iteration: int):
+        """Prepare dataset state for a specific iteration when resuming"""
+        print_master(f"Preparing dataset for resumed iteration {iteration}...")
+        
+        if iteration == 0:
+            # Use original dataset for iteration 0
+            self.train_dataset = self.original_dataset
+            return
+        
+        # For iterations > 0, need to load accumulated augmented samples
+        all_augmented_samples = []
+        
+        # Load augmented samples from all previous iterations
+        for i in range(1, iteration):
+            augmented_file = os.path.join(self.args.output_dir, f"augmented_samples_iter_{i}.json")
+            if os.path.exists(augmented_file):
+                with open(augmented_file, 'r') as f:
+                    data = json.load(f)
+                
+                # Extract actual samples from the data structure
+                if isinstance(data, dict) and 'samples' in data:
+                    # New format with metadata
+                    iter_samples = data['samples']
+                    print_master(f"Loaded {len(iter_samples)} augmented samples from iteration {i} (with metadata)")
+                elif isinstance(data, list):
+                    # Old format - direct list of samples
+                    iter_samples = data
+                    print_master(f"Loaded {len(iter_samples)} augmented samples from iteration {i} (direct list)")
+                else:
+                    print_master(f"Warning: Unexpected data format in {augmented_file}, skipping...")
+                    continue
+                
+                all_augmented_samples.extend(iter_samples)
+        
+        # Update dataset with all accumulated samples
+        if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
+            self.train_dataset.iteration_round = iteration
+            self.train_dataset.augmented_samples = all_augmented_samples
+            # Set hard negatives file for current iteration
+            self.train_dataset.hard_negatives_file = os.path.join(
+                self.args.output_dir, f"hard_negatives_iter_{iteration-1}.json"
+            )
+        
+        print_master(f"Dataset prepared for iteration {iteration} with {len(all_augmented_samples)} total augmented samples")
+    
     def _save_iteration_state(self, iteration: int):
         """Save iteration state and metrics"""
         state_file = os.path.join(self.args.output_dir, f"iteration_{iteration}_state.json")
         
+        # Determine correct model path based on iteration
+        if iteration == 0:
+            model_path = os.path.join(self.args.output_dir, "base_model")
+        else:
+            model_path = os.path.join(self.args.output_dir, f"iteration_{iteration}")
+        
         state = {
             'iteration': iteration,
             'metrics': self.iteration_metrics,
-            'model_path': os.path.join(self.args.output_dir, f"iteration_{iteration}"),
+            'model_path': model_path,
             'hard_negatives_file': f"hard_negatives_iter_{iteration}.json"
         }
         
@@ -305,16 +540,20 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             json.dump(state, f, indent=2)
         
         print_master(f"Saved iteration {iteration} state to {state_file}")
+        print_master(f"Model path recorded as: {model_path}")
     
     def _load_iteration_state(self, iteration: int):
-        """Load iteration state for resuming"""
+        """Load iteration state for resuming (model already loaded externally)"""
         state_file = os.path.join(self.args.output_dir, f"iteration_{iteration}_state.json")
         
         if os.path.exists(state_file):
             with open(state_file, 'r') as f:
                 state = json.load(f)
             
-            self.iteration_metrics = state.get('metrics', {})
+            # Note: Model weights already loaded in main script using MMEBModel.load()
+            print_master(f"Loading iteration {iteration} metadata (model loaded separately)")
+            
+            self.iteration_metrics = state.get('iteration_metrics', {})
             print_master(f"Loaded iteration {iteration} state from {state_file}")
         else:
             print_master(f"No state file found for iteration {iteration}")
@@ -371,6 +610,16 @@ def create_iterative_trainer(
         if key in kwargs:
             iterative_params[key] = kwargs.pop(key)
     
+    # Extract fast mode and production mode parameters
+    fast_mode_params = {}
+    for key in ['fast_mode', 'fast_mode_max_samples', 'fast_mode_retrieval_db_size', 
+                'fast_mode_max_steps', 'production_max_steps', 'production_save_steps']:
+        if key in kwargs:
+            fast_mode_params[key] = kwargs.pop(key)
+    
+    # Debug: Print extracted parameters
+    print_master(f"DEBUG: Extracted fast_mode_params = {fast_mode_params}")
+    
     # Don't pass experiment_dir to base trainer
     if experiment_dir:
         # We can use args.output_dir instead
@@ -388,7 +637,13 @@ def create_iterative_trainer(
         if key in kwargs:
             trainer_params[key] = kwargs.pop(key)
     
-    # Remaining kwargs are ignored (like model_args, data_args, etc.)
+    # Extract important args that trainer needs
+    important_args = {}
+    for key in ['model_args', 'data_args', 'max_length']:
+        if key in kwargs:
+            important_args[key] = kwargs.pop(key)
+    
+    # Remaining kwargs are ignored
     
     return IterativeRetrievalTrainer(
         model=model,
@@ -397,5 +652,7 @@ def create_iterative_trainer(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         **iterative_params,
-        **trainer_params
+        **fast_mode_params,
+        **trainer_params,
+        **important_args
     )

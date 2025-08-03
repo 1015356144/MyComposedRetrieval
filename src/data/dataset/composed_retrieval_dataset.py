@@ -101,10 +101,14 @@ class IterativeCIRRDataset(Dataset):
         else:
             print_rank(f"No hard negatives cache found for iteration {iteration_round-1}")
     
-    def collect_hard_negatives_batch(self, retrieval_model, batch_size: int = 8):
+    def collect_hard_negatives_batch(self, retrieval_model, batch_size: int = 8, max_samples: int = None):
         """
         Collect hard negatives by running retrieval with current model
-        Note: Reduced batch_size for real retrieval to avoid memory issues
+        
+        Args:
+            retrieval_model: The model to use for retrieval
+            batch_size: Batch size for processing (default: 8)
+            max_samples: Maximum number of samples to process (None for no limit)
         """
         print_rank(f"Collecting hard negatives for iteration {self.iteration_round}")
         
@@ -114,6 +118,12 @@ class IterativeCIRRDataset(Dataset):
             with open(self.hard_negatives_file, 'r') as f:
                 hard_negatives = json.load(f)
             self.hard_negatives_cache = hard_negatives
+            
+            # Apply max_samples limit to cached results if specified
+            if max_samples is not None and len(hard_negatives) > max_samples:
+                print_rank(f"Limiting cached hard negatives from {len(hard_negatives)} to {max_samples}")
+                hard_negatives = hard_negatives[:max_samples]
+            
             print_rank(f"Loaded {len(hard_negatives)} existing hard negative samples")
             return hard_negatives
         
@@ -122,10 +132,17 @@ class IterativeCIRRDataset(Dataset):
         hard_negatives = []
         retrieval_model.eval()
         
-        # Use smaller batches for real retrieval and limit total samples for efficiency
-        max_samples = min(1000, len(self.annotations))  # Limit to 1000 samples for efficiency
-        sample_annotations = self.annotations[:max_samples]
+        # Determine sampling limit based on max_samples parameter
+        if max_samples is not None:
+            # Fast mode or user-specified limit
+            sample_limit = min(max_samples, len(self.annotations))
+            print_rank(f"Using specified max_samples limit: {sample_limit}")
+        else:
+            # Production mode: use all available samples
+            sample_limit = len(self.annotations)
+            print_rank(f"Production mode: processing all {sample_limit} samples")
         
+        sample_annotations = self.annotations[:sample_limit]
         print_rank(f"Processing {len(sample_annotations)} samples for hard negative mining...")
         
         with torch.no_grad():
@@ -145,11 +162,17 @@ class IterativeCIRRDataset(Dataset):
                     })
                 
                 # Run retrieval for this batch
-                retrieval_results = self._run_retrieval_batch(retrieval_model, batch)
+                retrieval_results = self._run_retrieval_batch(retrieval_model, batch, max_samples)
                 
                 # Identify hard negatives (incorrect retrievals in top-k)
                 batch_hard_negs = self._identify_hard_negatives(batch, retrieval_results)
                 hard_negatives.extend(batch_hard_negs)
+                
+                # Early stopping if we've collected enough hard negatives
+                if max_samples is not None and len(hard_negatives) >= max_samples:
+                    print_rank(f"Collected {len(hard_negatives)} hard negatives, reaching max_samples limit")
+                    hard_negatives = hard_negatives[:max_samples]
+                    break
         
         # Save hard negatives to experiment directory
         with open(self.hard_negatives_file, 'w') as f:
@@ -161,7 +184,7 @@ class IterativeCIRRDataset(Dataset):
         
         return hard_negatives
     
-    def _run_retrieval_batch(self, model, batch):
+    def _run_retrieval_batch(self, model, batch, max_samples=None):
         """Run real retrieval for a batch of queries using the actual VLM2Vec model"""
         import torch.nn.functional as F
         
@@ -169,12 +192,12 @@ class IterativeCIRRDataset(Dataset):
         print_rank(f"Running real retrieval for {batch_size} queries")
         
         try:
-            return self._run_real_retrieval(model, batch)
+            return self._run_real_retrieval(model, batch, max_samples)
         except Exception as e:
             print_rank(f"Real retrieval failed: {e}, falling back to simplified retrieval")
             return self._run_simplified_retrieval(batch)
     
-    def _run_real_retrieval(self, model, batch):
+    def _run_real_retrieval(self, model, batch, max_samples=None):
         """Run real retrieval using VLM2Vec model"""
         import torch.nn.functional as F
         
@@ -189,12 +212,24 @@ class IterativeCIRRDataset(Dataset):
             print_rank("Warning: No processor found in model")
             raise Exception("No processor available")
         
-        # Collect target images for retrieval database (limit for efficiency)
+        # Collect target images for retrieval database with dynamic limit
         target_database = []
         target_paths = []
         
-        # Use a reasonable subset of CIRR for retrieval database
-        max_targets = min(200, len(self.annotations))  # Limit to 200 targets
+        # Determine retrieval database size based on max_samples and fast mode settings
+        if max_samples is not None and max_samples <= 100:
+            # Fast mode: use retrieval db size from configuration or default
+            if hasattr(self, 'fast_mode_retrieval_db_size'):
+                max_targets = min(self.fast_mode_retrieval_db_size, len(self.annotations))
+                print_rank(f"Fast mode: using configured retrieval database ({max_targets} targets)")
+            else:
+                max_targets = min(50, len(self.annotations))
+                print_rank(f"Fast mode: using default small retrieval database ({max_targets} targets)")
+        else:
+            # Normal/production mode: use larger retrieval database
+            max_targets = min(200, len(self.annotations))
+            print_rank(f"Normal mode: using standard retrieval database ({max_targets} targets)")
+        
         target_annotations = self.annotations[:max_targets]
         
         for ann in target_annotations:
@@ -707,9 +742,11 @@ class IterativeCIRRDataset(Dataset):
             return []
         
         # Check if augmented samples already exist for this iteration
-        aug_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{self.iteration_round}.json")
+        # Note: We generate samples for the NEXT iteration, so use iteration_round + 1
+        next_iteration = self.iteration_round + 1
+        aug_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{next_iteration}.json")
         if os.path.exists(aug_file):
-            print_rank(f"Augmented samples already exist for iteration {self.iteration_round}, loading from {aug_file}")
+            print_rank(f"Augmented samples already exist for iteration {next_iteration}, loading from {aug_file}")
             try:
                 with open(aug_file, 'r') as f:
                     saved_data = json.load(f)
@@ -752,6 +789,15 @@ class IterativeCIRRDataset(Dataset):
                 batch_time = time.time() - batch_start_time
                 augmented_samples.extend(batch_augmented)
                 print_rank(f"Batch {batch_idx}/{total_batches} completed in {batch_time:.1f}s, generated {len(batch_augmented)} augmented samples")
+                
+                # 增量保存：每100个批次保存一次
+                if batch_idx % 100 == 0 or batch_idx == total_batches:
+                    print_rank(f"Performing incremental save at batch {batch_idx}/{total_batches}")
+                    try:
+                        self._save_augmented_samples_incremental(augmented_samples, batch_idx)
+                    except Exception as save_e:
+                        print_rank(f"Warning: Incremental save failed: {save_e}")
+                
             except Exception as e:
                 print_rank(f"Error generating captions for batch {batch_idx}/{total_batches}: {e}")
                 # Skip this batch and continue
@@ -765,7 +811,7 @@ class IterativeCIRRDataset(Dataset):
         
         # Save augmented samples to experiment directory
         if len(augmented_samples) > 0:
-            self._save_augmented_samples(augmented_samples)
+            self._save_augmented_samples(augmented_samples)  # 这里才保存
         
         return augmented_samples
     
@@ -956,16 +1002,6 @@ ASSISTANT:"""
         
         import random
         return random.choice(prompt_templates)
-    
-    def _create_llava_prompt(self, original_text: str) -> str:
-        """Create prompt for LLaVA model"""
-        return f"""USER: I have two images. Please describe how to modify the first image to look like the second image. The original description was: "{original_text}". Please generate a similar but different description.
-
-ASSISTANT:"""
-    
-    def _create_generic_prompt(self, original_text: str) -> str:
-        """Create generic prompt for other models"""
-        return f"""Describe how to modify the reference image to match the target image. Original: "{original_text}". Generate a similar description:"""
     
     def _prepare_qwen_inputs(self, ref_image, target_image, prompt, processor, device):
         """Prepare inputs for Qwen2-VL"""
@@ -1287,14 +1323,15 @@ ASSISTANT:"""
             print_rank("No experiment directory set, skipping augmented samples save")
             return
         
-        # Save with iteration round
-        aug_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{self.iteration_round}.json")
+        # Save with iteration round (for next iteration)
+        next_iteration = self.iteration_round + 1
+        aug_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{next_iteration}.json")
         
         # Create summary statistics
         summary = {
             'total_samples': len(augmented_samples),
             'generation_timestamp': time.time(),
-            'iteration_round': self.iteration_round,
+            'iteration_round': next_iteration,  # Use next iteration number
             'sample_statistics': {
                 'avg_original_length': sum(len(s.get('original_mod_text', '')) for s in augmented_samples) / len(augmented_samples) if augmented_samples else 0,
                 'avg_generated_length': sum(len(s.get('modification_text', '')) for s in augmented_samples) / len(augmented_samples) if augmented_samples else 0,
@@ -1312,6 +1349,59 @@ ASSISTANT:"""
                       f"avg_generated_len={summary['sample_statistics']['avg_generated_length']:.1f}")
         except Exception as e:
             print_rank(f"Error saving augmented samples: {e}")
+    
+    def _save_augmented_samples_incremental(self, all_augmented_samples: List[Dict], batch_idx: int):
+        """Incrementally save augmented samples to experiment directory"""
+        import json
+        import os
+        import time
+        
+        if not hasattr(self, 'experiment_dir') or not self.experiment_dir:
+            print_rank("No experiment directory set, skipping augmented samples save")
+            return
+        
+        # Save with iteration round (for next iteration)
+        next_iteration = self.iteration_round + 1
+        aug_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{next_iteration}.json")
+        
+        # Create summary statistics
+        summary = {
+            'total_samples': len(all_augmented_samples),
+            'generation_timestamp': time.time(),
+            'iteration_round': next_iteration,  # Use next iteration number
+            'last_saved_batch': batch_idx,
+            'sample_statistics': {
+                'avg_original_length': sum(len(s.get('original_mod_text', '')) for s in all_augmented_samples) / len(all_augmented_samples) if all_augmented_samples else 0,
+                'avg_generated_length': sum(len(s.get('modification_text', '')) for s in all_augmented_samples) / len(all_augmented_samples) if all_augmented_samples else 0,
+                'unique_reference_images': len(set(s.get('reference_image', '') for s in all_augmented_samples)),
+                'unique_target_images': len(set(s.get('target_image', '') for s in all_augmented_samples))
+            },
+            'samples': all_augmented_samples  # 保存所有当前的样本
+        }
+        
+        try:
+            # 创建临时文件，然后原子性替换
+            temp_file = aug_file + '.tmp'
+            with open(temp_file, 'w') as f:
+                json.dump(summary, f, indent=2)
+            
+            # 原子性替换
+            import os
+            if os.path.exists(aug_file):
+                os.remove(aug_file)
+            os.rename(temp_file, aug_file)
+            
+            print_rank(f"Incrementally saved {len(all_augmented_samples)} augmented samples to {aug_file} (batch {batch_idx})")
+            
+        except Exception as e:
+            print_rank(f"Error incrementally saving augmented samples: {e}")
+            # 清理临时文件
+            temp_file = aug_file + '.tmp'
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
 
 
 class IterativeFashionIQDataset(IterativeCIRRDataset):

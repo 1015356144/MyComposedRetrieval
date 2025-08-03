@@ -118,9 +118,55 @@ def main():
             wandb.config.update(data_args)
             wandb.config.update(training_args)
 
-    # Load retrieval model
+    # Load retrieval model with checkpoint resume support
     print_master("Loading retrieval model...")
-    model = MMEBModel.build(model_args)
+    
+    # Check for iterative training checkpoints
+    resume_from_iteration = None
+    if training_args.resume_from == 'auto':
+        # Auto-detect latest iteration checkpoint
+        for i in range(10, -1, -1):  # Check last 10 iterations
+            iter_checkpoint = os.path.join(training_args.output_dir, f"iteration_{i}")
+            if os.path.exists(iter_checkpoint):
+                resume_from_iteration = i
+                print_master(f"Found iteration checkpoint: iteration_{i}")
+                break
+    elif training_args.resume_from.startswith('iter_'):
+        # Manual iteration specification: iter_2
+        iter_num = training_args.resume_from.split('_')[1]
+        if iter_num.isdigit():
+            iter_checkpoint = os.path.join(training_args.output_dir, f"iteration_{iter_num}")
+            if os.path.exists(iter_checkpoint):
+                resume_from_iteration = int(iter_num)
+                print_master(f"Manually resuming from iteration_{iter_num}")
+    
+    # Load model based on checkpoint availability
+    if resume_from_iteration is not None:
+        # Load from iteration checkpoint
+        iter_checkpoint_path = os.path.join(training_args.output_dir, f"iteration_{resume_from_iteration}")
+        print_master(f"Loading model from iteration checkpoint: {iter_checkpoint_path}")
+        
+        try:
+            model = MMEBModel.load(iter_checkpoint_path, model_args)
+            print_master(f"Successfully loaded model from iteration {resume_from_iteration}")
+        except Exception as e:
+            print_master(f"Failed to load iteration checkpoint: {e}")
+            print_master("Falling back to base model...")
+            model = MMEBModel.build(model_args)
+            resume_from_iteration = None
+    else:
+        # Build new model or load from regular checkpoint
+        if resume_checkpoint_dir:
+            try:
+                print_master(f"Loading model from checkpoint: {resume_checkpoint_dir}")
+                model = MMEBModel.load(resume_checkpoint_dir, model_args)
+            except Exception as e:
+                print_master(f"Failed to load checkpoint: {e}")
+                print_master("Building new model...")
+                model = MMEBModel.build(model_args)
+        else:
+            model = MMEBModel.build(model_args)
+    
     model_backbone = get_backbone_name(hf_config=model.config)
     setattr(model_args, 'model_backbone', model_backbone)
     setattr(training_args, 'model_backbone', model_backbone)
@@ -159,15 +205,40 @@ def main():
         iterative_params = {}
         for config_name, config in dataset_config.items():
             if isinstance(config, dict):
+                # Basic iterative parameters
                 iterative_params.update({
                     'max_iterations': config.get('max_iterations', 3),
                     'hard_neg_collection_freq': config.get('hard_neg_collection_freq', 1),
                     'caption_generation_batch_size': config.get('caption_generation_batch_size', 8)
                 })
+                
+                # Fast mode and production mode parameters
+                fast_mode = config.get('fast_mode', False)
+                iterative_params['fast_mode'] = fast_mode
+                
+                if fast_mode:
+                    # Use fast mode settings
+                    iterative_params.update({
+                        'fast_mode_max_samples': config.get('fast_mode_max_samples', 100),
+                        'fast_mode_retrieval_db_size': config.get('fast_mode_retrieval_db_size', 50),
+                        'fast_mode_max_steps': config.get('fast_mode_max_steps', 5)
+                    })
+                    print_master(f"Fast mode enabled: {config.get('fast_mode_max_steps', 5)} steps per iteration")
+                else:
+                    # Use production mode settings
+                    iterative_params.update({
+                        'production_max_steps': config.get('production_max_steps', 1000),
+                        'production_save_steps': config.get('production_save_steps', 100)
+                    })
+                    print_master(f"Production mode enabled: {config.get('production_max_steps', 1000)} steps per iteration")
+                
                 break
         
         # Create initial dataset for iteration 0
         train_dataset = init_mixed_dataset(dataset_config, model_args, data_args, training_args)
+        
+        # Debug: Print iterative_params to verify fast_mode is included
+        print_master(f"DEBUG: iterative_params = {iterative_params}")
         
         trainer = create_iterative_trainer(
             model=model,
@@ -181,8 +252,13 @@ def main():
             **iterative_params
         )
         
-        # Start iterative training
-        trainer.iterative_train(resume_from_iteration=0)
+        # Start iterative training with proper resume handling
+        if resume_from_iteration is not None:
+            print_master(f"Resuming iterative training from iteration {resume_from_iteration + 1}")
+            trainer.iterative_train(resume_from_iteration=resume_from_iteration + 1)
+        else:
+            print_master("Starting iterative training from scratch")
+            trainer.iterative_train(resume_from_iteration=0)
         
     else:
         print_master("Creating standard trainer...")
@@ -192,6 +268,7 @@ def main():
             processing_class=processor,
             args=training_args,
             model_args=model_args,
+            data_args=data_args,
             train_dataset=train_dataset,
             data_collator=train_collator,
             max_length=data_args.max_len,

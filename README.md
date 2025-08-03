@@ -42,44 +42,101 @@ python train_iterative.py \
 
 ## Configuration
 
-### Training Parameters
+### Training Modes
 
-- `--num_iterations`: Number of iterative rounds (default: 3)
-- `--hard_negative_k`: Top-k for hard negative mining (default: 5)
-- `--foundation_model_path`: Path to foundation model for caption generation
-- `--fast_mode`: Use subset of data for quick testing
-- `--auto_resume`: Automatically resume from latest checkpoint
+#### Fast Mode (for testing and debugging)
+```yaml
+# In your YAML config file
+fast_mode: true
+fast_mode_max_samples: 100        # Limit samples per iteration
+fast_mode_retrieval_db_size: 50   # Limit retrieval database size  
+fast_mode_max_steps: 5            # Limit training steps per iteration
+```
 
-### Model Parameters
+#### Production Mode (for full training)
+```yaml
+# In your YAML config file  
+fast_mode: false
+production_max_steps: 1000        # Full training steps per iteration
+production_save_steps: 100        # Save frequency
+```
 
-- `--model_backbone`: VLM backbone (qwen2_vl, llava, etc.)
-- `--foundation_model_backbone`: Foundation model type (qwen2_vl, llava)
-- `--batch_size`: Training batch size
-- `--learning_rate`: Learning rate
+### Key Parameters
+
+- `fast_mode`: Enable fast mode for quick testing (default: false)
+- `max_iterations`: Number of iterative rounds (default: 3)
+- `hard_neg_collection_freq`: Frequency of hard negative collection (default: 1)
+- `caption_generation_batch_size`: Batch size for caption generation (default: 8)
+- `foundation_model_name`: Foundation model for caption generation
 
 ### Example Commands
 
 ```bash
 # Full training with Qwen2VL foundation model
 python train_iterative.py \
-    --model_backbone qwen2_vl \
-    --dataset_name cirr \
-    --num_iterations 5 \
-    --hard_negative_k 10 \
-    --foundation_model_path ./models/Qwen2-VL-2B-Instruct \
-    --batch_size 32 \
-    --learning_rate 1e-5
+    --model_name Qwen/Qwen2-VL-2B-Instruct \
+    --output_dir ./experiments/iterative_cirr \
+    --dataset_config configs/cirr_iterative.yaml \
+    --foundation_model_name Qwen/Qwen2-VL-7B-Instruct \
+    --max_iterations 5
 
-# Resume training from iteration 2
+# Auto resume from latest checkpoint
 python train_iterative.py \
-    --experiment_dir ./experiments/qwen2_vl_cirr_iterative \
-    --resume_from_iteration 2
+    --model_name Qwen/Qwen2-VL-2B-Instruct \
+    --output_dir ./experiments/iterative_cirr \
+    --resume_from auto \
+    --dataset_config configs/cirr_iterative.yaml
+
+# Resume from specific iteration
+python train_iterative.py \
+    --model_name Qwen/Qwen2-VL-2B-Instruct \
+    --output_dir ./experiments/iterative_cirr \
+    --resume_from iter_2 \
+    --dataset_config configs/cirr_iterative.yaml
 
 # Fast mode for debugging
 python train_iterative.py \
-    --fast_mode \
-    --num_iterations 2
+    --model_name Qwen/Qwen2-VL-2B-Instruct \
+    --output_dir ./experiments/test_fast \
+    --dataset_config configs/cirr_iterative.yaml \
+    --fast_mode
 ```
+
+## Resume Training
+
+### Resume Options
+
+1. **Auto Resume** (`--resume_from auto`): Automatically detects and resumes from the latest iteration checkpoint
+2. **Manual Resume** (`--resume_from iter_X`): Resumes from a specific iteration (e.g., `iter_2`)
+3. **Standard Checkpoint** (`--resume_from checkpoint-1000`): Resumes from a HuggingFace checkpoint
+4. **Fresh Start**: No resume parameter, starts training from scratch
+
+### File Structure
+
+```
+output_dir/
+├── base_model/                      # Iteration 0 base model
+├── iteration_1/                     # Iteration 1 model weights
+├── iteration_2/                     # Iteration 2 model weights
+├── iteration_3/                     # Iteration 3 model weights
+├── iteration_0_state.json           # Iteration 0 training state
+├── iteration_1_state.json           # Iteration 1 training state
+├── iteration_2_state.json           # Iteration 2 training state
+├── hard_negatives_iter_0.json       # Hard negatives for iteration 0
+├── hard_negatives_iter_1.json       # Hard negatives for iteration 1
+├── hard_negatives_iter_2.json       # Hard negatives for iteration 2
+├── augmented_samples_iter_1.json    # Augmented samples for iteration 1
+├── augmented_samples_iter_2.json    # Augmented samples for iteration 2
+├── augmented_samples_iter_3.json    # Augmented samples for iteration 3
+└── training_summary.json            # Training summary
+```
+
+### Resume Mechanism
+
+- **Model Loading**: Uses `MMEBModel.load()` for unified model weight management (supports both LoRA and full models)
+- **State Recovery**: Loads training state from `iteration_X_state.json`
+- **Data Recovery**: Restores dataset state from augmented samples and hard negatives
+- **Error Handling**: Automatically falls back to base model if checkpoint loading fails
 
 ## Evaluation
 
@@ -106,17 +163,25 @@ python eval_iterative.py \
 ├── src/
 │   ├── data/dataset/
 │   │   └── composed_retrieval_dataset.py  # Iterative CIRR dataset with real retrieval
-│   ├── trainer_iterative.py              # Iterative trainer implementation
+│   ├── trainer_iterative.py              # Iterative trainer implementation  
+│   ├── arguments.py                       # Training arguments definition
 │   └── ...
-├── train_iterative.py                    # Training script
-├── eval_iterative.py                     # Evaluation script
+├── configs/
+│   └── cirr_iterative.yaml               # Iterative training configuration
+├── train_iterative.py                    # Main training script
 ├── run_iterative_training.sh             # Training shell script
 └── experiments/                          # Experiment outputs
-    └── {model}_{dataset}_iterative/
-        ├── hard_negatives_iter_0.json    # Hard negatives per iteration
-        ├── augmented_samples_iter_1.json # Generated augmented samples
-        ├── checkpoint_iter_1/            # Model checkpoints
-        └── evaluation_results.json       # Evaluation results
+    └── {experiment_name}/
+        ├── base_model/                    # Base model checkpoint (iteration 0)
+        ├── iteration_1/                   # Iteration 1 model checkpoint
+        ├── iteration_2/                   # Iteration 2 model checkpoint
+        ├── hard_negatives_iter_0.json     # Hard negatives per iteration
+        ├── hard_negatives_iter_1.json     
+        ├── augmented_samples_iter_1.json  # Generated augmented samples
+        ├── augmented_samples_iter_2.json
+        ├── iteration_0_state.json         # Training state per iteration
+        ├── iteration_1_state.json
+        └── training_summary.json          # Training summary and results
 ```
 
 ## How It Works

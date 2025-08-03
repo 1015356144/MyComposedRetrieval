@@ -41,6 +41,12 @@ checkpoints/
 models/
 *.pth
 *.pt
+*.ckpt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.model
 
 # Logs and outputs
 logs/
@@ -48,11 +54,38 @@ wandb/
 outputs/
 experiments/*/
 *.log
+*.out
+*.err
+results/
+runs/
 
-# Data files
+# Data files (large datasets)
 *.json
 !requirements.txt
 !configs/*.json
+!hard_negatives_iter_0.json  # Keep small example files
+*.jsonl
+*.csv
+*.tsv
+*.txt
+!requirements.txt
+!README.md
+!*.py
+
+# Large data directories
+data/
+datasets/
+images/
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Evaluation results (can be large)
+evaluation_results/
+metrics/
+predictions/
 
 # OS
 .DS_Store
