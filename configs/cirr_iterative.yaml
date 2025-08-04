@@ -7,7 +7,7 @@ CIRR:
     data_dir: /home/guohaiyun/yty_data/CIRR/cirr  # local data directory
     image_base_dir: /home/guohaiyun/yty_data/CIRR  # base directory for images
     captions_file: /home/guohaiyun/yty_data/CIRR/cirr/captions/cap.rc2.train.json  # captions file
-    image_splits_file: /home/guohaiyun/yty_data/CIRR/cirr/image_splits/split.rc2.train.json  # image paths mapping
+    image_splits_file: /home/guohaiyun/yty_data/CIRR/cirr/image_splits/split.rc2.train.json  # ALL candidate images for retrieval (硬负样本挖掘的候选图像集)
     num_sample_per_subset: 1000  # reduced for testing
     weight: 1.0
     

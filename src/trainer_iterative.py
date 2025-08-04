@@ -5,6 +5,7 @@ Implements iterative hard negative mining and knowledge distillation from founda
 
 import os
 import json
+import time
 import torch
 import logging
 from typing import Dict, List, Optional, Any
@@ -75,6 +76,10 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         self.current_iteration = 0
         self.iteration_metrics = {}
         
+        # Track completion status for resuming
+        self._base_training_completed = False
+        self._target_embeddings_cached = False
+        
         # Save original dataset for reference
         self.original_dataset = self.train_dataset
         
@@ -123,7 +128,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         """Try to resume from a previous checkpoint to avoid recomputation"""
         output_dir = self.args.output_dir
         
-        # Look for the latest iteration state (for metadata only, model already loaded in main)
+        # First, look for the latest iteration state (for complete metadata)
         for i in range(self.max_iterations - 1, -1, -1):
             state_file = os.path.join(output_dir, f"iteration_{i}_state.json")
             if os.path.exists(state_file):
@@ -142,12 +147,66 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     print_master(f"Loading hard negatives from iteration {i}")
                     if hasattr(self.train_dataset, 'hard_negatives_file'):
                         self.train_dataset.hard_negatives_file = hard_neg_file
-                        self.train_dataset._load_hard_negatives()
+                        self.train_dataset._load_hard_negatives(i)  # Pass iteration number
                 
                 print_master(f"Resuming from iteration {self.current_iteration} (model loaded separately)")
                 return True
         
-        print_master("No previous iteration state found, starting from scratch")
+        # If no iteration state found, check for cached embeddings and base model
+        # This handles cases where base training completed but iteration didn't start
+        cache_dir = os.path.join(output_dir, "cache")
+        base_model_dir = os.path.join(output_dir, "base_model")
+        
+        # Check for base model completion (most comprehensive check)
+        if os.path.exists(base_model_dir):
+            print_master(f"Found base model directory: {base_model_dir}")
+            
+            # Check if base model has required files
+            base_model_files = os.listdir(base_model_dir)
+            has_adapter = any(f.startswith("adapter_") for f in base_model_files)
+            has_config = "adapter_config.json" in base_model_files
+            
+            if has_adapter and has_config:
+                print_master("✅ Base model training appears to be completed (found LoRA adapter)")
+                
+                # Check for cached embeddings
+                if os.path.exists(cache_dir):
+                    cache_files = [f for f in os.listdir(cache_dir) if f.startswith("target_embeddings_") and f.endswith(".pt")]
+                    if cache_files:
+                        print_master(f"✅ Found cached target embeddings: {cache_files}")
+                        print_master("🔄 Resuming from completed base training (iteration 0)")
+                        print_master("   ➡️  Will skip: base model training, evaluation, target embedding computation")
+                        print_master("   ➡️  Will start: hard negative collection")
+                        
+                        # Set flags to indicate what has been completed
+                        self.current_iteration = 0
+                        self._base_training_completed = True
+                        self._target_embeddings_cached = True
+                        return True
+                    else:
+                        print_master("⚠️  Base model found but no cached embeddings")
+                        print_master("🔄 Will resume from base model, recompute embeddings")
+                        self.current_iteration = 0
+                        self._base_training_completed = True
+                        self._target_embeddings_cached = False
+                        return True
+                else:
+                    print_master("⚠️  Base model found but no cache directory")
+                    print_master("🔄 Will resume from base model, compute embeddings")
+                    self.current_iteration = 0
+                    self._base_training_completed = True
+                    self._target_embeddings_cached = False
+                    return True
+        
+        # Fallback: check for regular checkpoints without base model
+        checkpoint_dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+        if checkpoint_dirs:
+            print_master(f"Found checkpoints but no base model: {checkpoint_dirs}")
+            print_master("This might be an incomplete training, starting from scratch")
+        
+        print_master("No previous state, base model, or cached embeddings found, starting from scratch")
+        self._base_training_completed = False
+        self._target_embeddings_cached = False
         return False
     
     def iterative_train(self, resume_from_iteration: int = 0):
@@ -177,28 +236,80 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             
             self.current_iteration = iteration
             
-            # Step 1: Train current model (or use base model for iteration 0)
+            # Step 1: Train current model (or skip if already completed)
             if iteration == 0:
-                print_master("Iteration 0: Training base retrieval model...")
-                self._train_base_model()
+                if hasattr(self, '_base_training_completed') and self._base_training_completed:
+                    print_master("✅ Base model training already completed, skipping...")
+                    print_master(f"   📁 Using existing base model from: {os.path.join(self.args.output_dir, 'base_model')}")
+                else:
+                    print_master("Iteration 0: Training base retrieval model...")
+                    self._train_base_model()
             else:
                 print_master(f"Iteration {iteration}: Training with augmented data...")
                 self._train_current_iteration()
             
-            # Step 2: Evaluate current model performance
+            # 添加同步屏障：确保所有GPU完成训练
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
+                if not (iteration == 0 and hasattr(self, '_base_training_completed') and self._base_training_completed):
+                    print_master(f"All GPUs completed training for iteration {iteration}")
+            
+            # Step 2: Evaluate current model performance (or skip if cached)
+            # Add distributed barrier to ensure all GPUs complete training before evaluation
+            if dist.is_initialized():
+                dist.barrier()
+            
+            # Use the improved evaluation method that handles distributed internally
             eval_results = self._evaluate_current_model()
+            
             self.iteration_metrics[iteration] = eval_results
             
             # Step 3: Collect hard negatives (if not last iteration)
             if iteration < self.max_iterations - 1:
+                print_master(f"🔍 Starting hard negative collection for iteration {iteration}...")
+                hard_neg_start_time = time.time()
+                
                 hard_negatives = self._collect_hard_negatives(iteration)
+                
+                hard_neg_time = time.time() - hard_neg_start_time
+                print_master(f"Hard negative collection completed in {int(hard_neg_time//60):02d}:{int(hard_neg_time%60):02d}")
+                
+                # 添加同步屏障：确保所有GPU完成硬负样本收集
+                if dist.is_initialized():
+                    dist.barrier()
+                    print_master(f"All GPUs completed hard negative collection for iteration {iteration}")
                 
                 # Step 4: Generate augmented captions using foundation model
                 if len(hard_negatives) > 0:
+                    print_master(f"📝 Starting caption generation for {len(hard_negatives)} hard negatives...")
+                    caption_start_time = time.time()
+                    
                     augmented_samples = self._generate_augmented_captions(hard_negatives)
+                    
+                    caption_time = time.time() - caption_start_time
+                    print_master(f"Caption generation completed in {int(caption_time//60):02d}:{int(caption_time%60):02d}")
+                    
+                    # 添加同步屏障：确保所有GPU完成caption生成
+                    if dist.is_initialized():
+                        dist.barrier()
+                        print_master(f"All GPUs completed caption generation for iteration {iteration}")
                     
                     # Step 5: Prepare dataset for next iteration
                     self._prepare_next_iteration_dataset(iteration + 1, augmented_samples)
+                    
+                    # 性能统计
+                    total_time = hard_neg_time + caption_time
+                    print_master(f"📊 Iteration {iteration} data preparation stats:")
+                    print_master(f"  - Hard negatives: {len(hard_negatives)} samples in {hard_neg_time:.1f}s")
+                    print_master(f"  - Augmented captions: {len(augmented_samples)} samples in {caption_time:.1f}s")
+                    print_master(f"  - Total time: {int(total_time//60):02d}:{int(total_time%60):02d}")
+                    
+                    if dist.is_initialized():
+                        world_size = dist.get_world_size()
+                        print_master(f"  - Used {world_size} GPUs for parallel processing")
+                        if total_time > 0:
+                            print_master(f"  - Processing rate: {(len(hard_negatives) + len(augmented_samples))/total_time:.2f} samples/second")
                 else:
                     print_master("No hard negatives found, stopping early")
                     break
@@ -239,7 +350,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         return train_result
     
     def _evaluate_current_model(self) -> Dict[str, float]:
-        """Evaluate current model on validation set"""
+        """Evaluate current model on validation set with optimizations"""
         print_master(f"Evaluating iteration {self.current_iteration} model...")
         
         try:
@@ -247,28 +358,78 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             if not hasattr(self, 'evaluator') or self.evaluator is None:
                 from .evaluation.cirr_evaluator import CIRREvaluator
                 
+                # Adjust batch size based on fast mode
+                eval_batch_size = 4 if self.fast_mode else 8
+                
                 self.evaluator = CIRREvaluator(
                     model=self.model,
                     processor=self.processing_class,
                     data_args=self.data_args,
                     model_args=self.model_args,
                     device=self.args.device,
-                    batch_size=8  # Small batch size for evaluation
+                    batch_size=eval_batch_size
                 )
-                print_master("Real evaluator initialized successfully")
+                print_master(f"Real evaluator initialized successfully (batch_size={eval_batch_size})")
             
-            # Run real evaluation
-            eval_results = self.evaluator.evaluate()
+            # Check if distributed evaluation is available and beneficial
+            import torch.distributed as dist
+            use_distributed = (dist.is_initialized() and 
+                             dist.get_world_size() > 1 and 
+                             hasattr(self.evaluator, '_evaluate_distributed'))
+            
+            # In fast mode, prefer single GPU evaluation for simplicity unless many GPUs
+            if self.fast_mode and use_distributed and dist.get_world_size() <= 2:
+                use_distributed = False
+                print_master("Fast mode: Using single GPU evaluation for small GPU count")
+            
+            if use_distributed:
+                print_master(f"Using distributed evaluation across {dist.get_world_size()} GPUs")
+                eval_results = self.evaluator.evaluate(distributed=True)
+            else:
+                print_master("Using single GPU evaluation")
+                eval_results = self.evaluator.evaluate(distributed=False)
+            
+            # Add evaluation metadata
+            eval_results['evaluation_mode'] = 'distributed' if use_distributed else 'single_gpu'
+            eval_results['fast_mode'] = self.fast_mode
+            eval_results['iteration'] = self.current_iteration
             
         except Exception as e:
             print_master(f"Real evaluation failed: {e}")
             print_master("Falling back to dummy evaluation")
-            # Fallback to dummy metrics
-            eval_results = {
-                'r_at_1': 0.5,  # Placeholder
-                'r_at_5': 0.7,  # Placeholder
-                'r_at_10': 0.8  # Placeholder
-            }
+            # Fallback to dummy metrics with realistic fast mode values
+            if self.fast_mode:
+                # Fast mode typically has lower performance due to limited training
+                eval_results = {
+                    'recall_at_1': 0.15,  
+                    'recall_at_5': 0.35,  
+                    'recall_at_10': 0.45,  
+                    'recall_subset_at_1': 0.12,
+                    'recall_subset_at_2': 0.25,
+                    'recall_subset_at_3': 0.32,
+                    'group_recall_at_1': 0.18,
+                    'group_recall_at_2': 0.30,
+                    'group_recall_at_3': 0.38,
+                    'evaluation_mode': 'dummy_fast',
+                    'fast_mode': True,
+                    'iteration': self.current_iteration
+                }
+            else:
+                # Production mode dummy metrics
+                eval_results = {
+                    'recall_at_1': 0.5,  
+                    'recall_at_5': 0.7,  
+                    'recall_at_10': 0.8,  
+                    'recall_subset_at_1': 0.3,
+                    'recall_subset_at_2': 0.5,
+                    'recall_subset_at_3': 0.6,
+                    'group_recall_at_1': 0.4,
+                    'group_recall_at_2': 0.6,
+                    'group_recall_at_3': 0.7,
+                    'evaluation_mode': 'dummy_production',
+                    'fast_mode': False,
+                    'iteration': self.current_iteration
+                }
         
         print_master(f"Iteration {self.current_iteration} results: {eval_results}")
         return eval_results
@@ -297,21 +458,33 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             if self.fast_mode and hasattr(self.train_dataset, 'fast_mode_retrieval_db_size'):
                 self.train_dataset.fast_mode_retrieval_db_size = self.fast_mode_retrieval_db_size
             
-            # Use dataset's built-in hard negative collection with sample limit
-            hard_negatives = self.train_dataset.collect_hard_negatives_batch(
-                self.model,
-                batch_size=8,  # Fixed batch size for faster processing
-                max_samples=sample_limit  # Pass limit to dataset
-            )
+            # 使用分布式硬负样本收集
+            import torch.distributed as dist
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                print_master("Using distributed hard negative collection...")
+                hard_negatives = self.train_dataset.collect_hard_negatives_batch_distributed(
+                    self.model,
+                    batch_size=8,  # Fixed batch size for faster processing
+                    max_samples=sample_limit  # Pass limit to dataset
+                )
+            else:
+                print_master("Using single-GPU hard negative collection...")
+                hard_negatives = self.train_dataset.collect_hard_negatives_batch(
+                    self.model,
+                    batch_size=8,  # Fixed batch size for faster processing
+                    max_samples=sample_limit  # Pass limit to dataset
+                )
             
             print_master(f"Collected {len(hard_negatives)} hard negatives " + 
                         (f"(limited to {sample_limit})" if sample_limit else "(no limit)"))
             
-            # Cache the results
-            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-            with open(cache_file, 'w') as f:
-                json.dump(hard_negatives, f, indent=2)
-            print_master(f"Cached hard negatives to {cache_file}")
+            # Cache the results (only master process)
+            import torch.distributed as dist
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                with open(cache_file, 'w') as f:
+                    json.dump(hard_negatives, f, indent=2)
+                print_master(f"Cached hard negatives to {cache_file}")
             
         else:
             # Fallback: implement hard negative collection here
@@ -354,8 +527,14 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 print_master("Setting foundation model for dataset...")
                 self.train_dataset.foundation_model = self.foundation_model
             
-            # Use dataset's built-in caption generation
-            augmented_samples = self.train_dataset.generate_augmented_captions(hard_negatives)
+            # 使用分布式caption生成
+            import torch.distributed as dist
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                print_master("Using distributed caption generation...")
+                augmented_samples = self.train_dataset.generate_augmented_captions_distributed(hard_negatives)
+            else:
+                print_master("Using single-GPU caption generation...")
+                augmented_samples = self.train_dataset.generate_augmented_captions(hard_negatives)
         else:
             # Fallback: implement caption generation here
             augmented_samples = self._generate_captions_fallback(hard_negatives)

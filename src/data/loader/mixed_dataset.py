@@ -34,10 +34,17 @@ def init_mixed_dataset(dataset_config, model_args, data_args, training_args):
     if len(train_datasets) > 1:
         train_dataset = interleave_datasets(train_datasets, probabilities=probs, batch_size=interleave_batch_size,
                                             seed=training_args.seed, stopping_strategy=training_args.interleave_stopping_strategy)
+        
+        # 只有当数据集被交错（interleaved）后，才需要手动进行分布式切分
+        # 因为 interleave_datasets 返回的 IterableDataset 没有 .shard() 方法
+        if torch.distributed.is_initialized():
+            print_master("Applying split_dataset_by_node to the interleaved dataset.")
+            train_dataset = split_dataset_by_node(train_dataset, rank=torch.distributed.get_rank(), world_size=world_size)
     else:
+        # 对于单个自定义数据集，我们不在这里进行切分
+        # Trainer 会自动调用其内部的 .shard() 方法
         train_dataset = train_datasets[0]
-    if torch.distributed.is_initialized():
-        train_dataset = split_dataset_by_node(train_dataset, rank=torch.distributed.get_rank(), world_size=world_size)
+        print_master("Skipping split_dataset_by_node for single custom dataset; Trainer will use .shard() method.")
 
     return train_dataset
 

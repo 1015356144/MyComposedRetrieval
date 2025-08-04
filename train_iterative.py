@@ -41,14 +41,25 @@ def load_foundation_model(model_args, data_args):
         
         # Load foundation model directly from transformers (not wrapped by MMEBModel)
         from transformers import AutoModelForVision2Seq, AutoProcessor
+        import torch.distributed as dist
         
-        # Load the raw foundation model with generate capability
-        foundation_model = AutoModelForVision2Seq.from_pretrained(
-            foundation_model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
+        # Check if we're in distributed mode to avoid tensor parallel issues
+        if dist.is_initialized():
+            # Distributed mode: avoid device_map to prevent tensor parallel conflicts
+            foundation_model = AutoModelForVision2Seq.from_pretrained(
+                foundation_model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=None,  # Avoid tensor parallel issues in PyTorch 2.4
+                trust_remote_code=True
+            )
+        else:
+            # Single GPU mode: use device_map="auto" for convenience
+            foundation_model = AutoModelForVision2Seq.from_pretrained(
+                foundation_model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True
+            )
         
         # Load processor
         foundation_processor = AutoProcessor.from_pretrained(

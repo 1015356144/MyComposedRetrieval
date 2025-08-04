@@ -309,13 +309,257 @@ class CIRREvaluator:
             return torch.randn(batch_size, 512)
 
     def _encode_images(self, image_names: List[str]) -> torch.Tensor:
-        """Encode a batch of images using unified encoding interface"""
+        """Encode a batch of images using unified encoding interface (wrapper for compatibility)"""
+        return self._encode_images_local(image_names)
+
+    def _encode_composed_queries(self, queries: List[Dict]) -> torch.Tensor:
+        """Encode composed queries using unified encoding interface (wrapper for compatibility)"""
+        return self._encode_composed_queries_local(queries)
+    
+    def evaluate(self, distributed=False) -> Dict[str, float]:
+        """
+        Perform full evaluation on CIRR test set
+        Returns recall@k metrics
+        
+        Args:
+            distributed (bool): Whether to use distributed evaluation across multiple GPUs
+        """
+        print_master("Starting CIRR evaluation...")
+        
+        # Set model to eval mode
+        self.model.eval()
+        
+        try:
+            if distributed:
+                return self._evaluate_distributed()
+            else:
+                return self._evaluate_single_gpu()
+                
+        except Exception as e:
+            print_master(f"Evaluation failed: {e}")
+            import traceback
+            print_master(f"Traceback: {traceback.format_exc()}")
+            # Return dummy metrics on failure
+            return {
+                'recall_at_1': 0.0,
+                'recall_at_5': 0.0,
+                'recall_at_10': 0.0,
+                'recall_subset_at_1': 0.0,
+                'recall_subset_at_2': 0.0,
+                'recall_subset_at_3': 0.0,
+                'group_recall_at_1': 0.0,
+                'group_recall_at_2': 0.0,
+                'group_recall_at_3': 0.0,
+            }
+    
+    def _evaluate_single_gpu(self) -> Dict[str, float]:
+        """Original single GPU evaluation"""
+        # Encode all candidate images
+        candidate_embeddings = self._encode_images(self.candidate_images)
+        candidate_embeddings = F.normalize(candidate_embeddings, p=2, dim=1)
+        
+        # Encode all composed queries
+        query_embeddings = self._encode_composed_queries(self.test_data)
+        query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
+        
+        # Compute similarities
+        print_master("Computing similarities...")
+        similarities = torch.mm(query_embeddings, candidate_embeddings.t())  # [num_queries, num_candidates]
+        
+        # Compute metrics using similarities (not rankings)
+        metrics = self._compute_recall_metrics(similarities)
+        
+        print_master("Evaluation completed!")
+        return metrics
+    
+    def _evaluate_distributed(self) -> Dict[str, float]:
+        """
+        Distributed evaluation across multiple GPUs
+        Both candidate images and queries are processed in parallel across GPUs
+        """
+        try:
+            import torch.distributed as dist
+            
+            if not dist.is_initialized():
+                print_master("Warning: Distributed not initialized, falling back to single GPU")
+                return self._evaluate_single_gpu()
+            
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            
+            print_master(f"Starting distributed evaluation on {world_size} GPUs")
+            
+            # Step 1: Distributed candidate image encoding
+            print_master(f"Rank {rank}: Starting distributed candidate image encoding...")
+            candidate_embeddings = self._encode_images_distributed()
+            candidate_embeddings = F.normalize(candidate_embeddings, p=2, dim=1)
+            
+            # Step 2: Distributed query encoding  
+            print_master(f"Rank {rank}: Starting distributed query encoding...")
+            query_embeddings = self._encode_queries_distributed()
+            query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
+            
+            # Step 3: Compute similarities (all ranks have full embeddings now)
+            print_master(f"Rank {rank}: Computing similarities...")
+            similarities = torch.mm(query_embeddings, candidate_embeddings.t())
+            
+            # Step 4: Only rank 0 computes final metrics
+            if rank == 0:
+                print_master("Computing final metrics...")
+                metrics = self._compute_recall_metrics(similarities)
+                print_master(f"Distributed evaluation completed! Results: {metrics}")
+                return metrics
+            else:
+                # Non-master ranks return empty dict (will be filled by broadcast in trainer)
+                return {}
+                
+        except Exception as e:
+            print_master(f"Distributed evaluation failed: {e}")
+            import traceback
+            print_master(f"Traceback: {traceback.format_exc()}")
+            
+            # Fallback to single GPU evaluation on rank 0
+            if not hasattr(dist, 'get_rank') or dist.get_rank() == 0:
+                print_master("Falling back to single GPU evaluation")
+                return self._evaluate_single_gpu()
+            else:
+                return {}
+    
+    def _encode_images_distributed(self) -> torch.Tensor:
+        """
+        Distributed encoding of candidate images
+        Each GPU processes a subset of images, then all embeddings are gathered
+        """
+        import torch.distributed as dist
+        
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        # Split candidate images across GPUs
+        total_images = len(self.candidate_images)
+        images_per_gpu = (total_images + world_size - 1) // world_size
+        start_idx = rank * images_per_gpu
+        end_idx = min(start_idx + images_per_gpu, total_images)
+        
+        local_images = self.candidate_images[start_idx:end_idx]
+        print_master(f"Rank {rank}: Encoding candidate images {start_idx}-{end_idx-1} ({len(local_images)} images)")
+        
+        # Encode local subset of candidate images
+        if len(local_images) > 0:
+            local_embeddings = self._encode_images_local(local_images)
+        else:
+            # Create empty tensor with correct dimensions
+            local_embeddings = torch.empty(0, 512, device=self.device)  # Assuming 512-dim embeddings
+        
+        # Gather all embeddings from all ranks
+        print_master(f"Rank {rank}: Gathering candidate embeddings...")
+        
+        # Get embedding dimension from local embeddings
+        if local_embeddings.numel() > 0:
+            embedding_dim = local_embeddings.size(1)
+        else:
+            # Fallback: get dimension from any non-empty rank
+            embedding_dim = 512  # Default assumption
+        
+        # Create properly sized tensors for gathering
+        max_local_images = images_per_gpu
+        padded_embeddings = torch.zeros(max_local_images, embedding_dim, device=self.device)
+        actual_local_size = local_embeddings.size(0)
+        if actual_local_size > 0:
+            padded_embeddings[:actual_local_size] = local_embeddings
+        
+        # Gather padded embeddings
+        embedding_list = [torch.zeros_like(padded_embeddings) for _ in range(world_size)]
+        dist.all_gather(embedding_list, padded_embeddings)
+        
+        # Reconstruct full embedding matrix
+        all_embeddings = []
+        for i, emb in enumerate(embedding_list):
+            gpu_start = i * images_per_gpu
+            gpu_end = min(gpu_start + images_per_gpu, total_images)
+            actual_size = gpu_end - gpu_start
+            if actual_size > 0:
+                all_embeddings.append(emb[:actual_size])
+        
+        full_embeddings = torch.cat(all_embeddings, dim=0)
+        print_master(f"Rank {rank}: Reconstructed {full_embeddings.size(0)} candidate embeddings")
+        
+        return full_embeddings
+    
+    def _encode_queries_distributed(self) -> torch.Tensor:
+        """
+        Distributed encoding of queries
+        Each GPU processes a subset of queries, then all embeddings are gathered
+        """
+        import torch.distributed as dist
+        
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        # Split queries across GPUs
+        total_queries = len(self.test_data)
+        queries_per_gpu = (total_queries + world_size - 1) // world_size
+        start_idx = rank * queries_per_gpu
+        end_idx = min(start_idx + queries_per_gpu, total_queries)
+        
+        local_queries = self.test_data[start_idx:end_idx]
+        print_master(f"Rank {rank}: Encoding queries {start_idx}-{end_idx-1} ({len(local_queries)} queries)")
+        
+        # Encode local subset of queries
+        if len(local_queries) > 0:
+            local_embeddings = self._encode_composed_queries_local(local_queries)
+        else:
+            # Create empty tensor with correct dimensions
+            local_embeddings = torch.empty(0, 512, device=self.device)  # Assuming 512-dim embeddings
+        
+        # Gather all embeddings from all ranks
+        print_master(f"Rank {rank}: Gathering query embeddings...")
+        
+        # Get embedding dimension
+        if local_embeddings.numel() > 0:
+            embedding_dim = local_embeddings.size(1)
+        else:
+            embedding_dim = 512  # Default assumption
+        
+        # Create properly sized tensors for gathering
+        max_local_queries = queries_per_gpu
+        padded_embeddings = torch.zeros(max_local_queries, embedding_dim, device=self.device)
+        actual_local_size = local_embeddings.size(0)
+        if actual_local_size > 0:
+            padded_embeddings[:actual_local_size] = local_embeddings
+        
+        # Gather padded embeddings
+        embedding_list = [torch.zeros_like(padded_embeddings) for _ in range(world_size)]
+        dist.all_gather(embedding_list, padded_embeddings)
+        
+        # Reconstruct full embedding matrix
+        all_embeddings = []
+        for i, emb in enumerate(embedding_list):
+            gpu_start = i * queries_per_gpu
+            gpu_end = min(gpu_start + queries_per_gpu, total_queries)
+            actual_size = gpu_end - gpu_start
+            if actual_size > 0:
+                all_embeddings.append(emb[:actual_size])
+        
+        full_embeddings = torch.cat(all_embeddings, dim=0)
+        print_master(f"Rank {rank}: Reconstructed {full_embeddings.size(0)} query embeddings")
+        
+        return full_embeddings
+    
+    def _encode_images_local(self, image_names: List[str]) -> torch.Tensor:
+        """Encode a subset of images on local GPU (used by distributed encoding)"""
         embeddings = []
         
-        print_master(f"Encoding {len(image_names)} candidate images...")
+        # Progress indication for distributed encoding
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            desc = f"Rank {rank}: Encoding images"
+        else:
+            desc = "Encoding images"
         
         # Process in batches
-        for i in tqdm(range(0, len(image_names), self.batch_size), desc="Encoding images"):
+        for i in tqdm(range(0, len(image_names), self.batch_size), desc=desc):
             batch_names = image_names[i:i+self.batch_size]
             batch_images = [self._load_image(name) for name in batch_names]
             
@@ -343,16 +587,22 @@ class CIRREvaluator:
             batch_embeddings = self._encode_batch(batch_data)
             embeddings.append(batch_embeddings)
         
-        return torch.cat(embeddings, dim=0)
+        return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0, 512, device=self.device)
     
-    def _encode_composed_queries(self, queries: List[Dict]) -> torch.Tensor:
-        """Encode composed queries using unified encoding interface"""
+    def _encode_composed_queries_local(self, queries: List[Dict]) -> torch.Tensor:
+        """Encode a subset of composed queries on local GPU (used by distributed encoding)"""
         embeddings = []
         
-        print_master(f"Encoding {len(queries)} composed queries...")
+        # Progress indication for distributed encoding
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            desc = f"Rank {rank}: Encoding queries"
+        else:
+            desc = "Encoding queries"
         
         # Process in batches
-        for i in tqdm(range(0, len(queries), self.batch_size), desc="Encoding queries"):
+        for i in tqdm(range(0, len(queries), self.batch_size), desc=desc):
             batch_queries = queries[i:i+self.batch_size]
             
             # Prepare batch - use correct CIRR key names
@@ -378,47 +628,13 @@ class CIRREvaluator:
             batch_data = {
                 'text': batch_texts,
                 'images': batch_images
-            }            # Use unified encoding function
+            }
+            
+            # Use unified encoding function
             batch_embeddings = self._encode_batch(batch_data)
             embeddings.append(batch_embeddings)
         
-        return torch.cat(embeddings, dim=0)
-    
-    def evaluate(self) -> Dict[str, float]:
-        """
-        Perform full evaluation on CIRR test set
-        Returns recall@k metrics
-        """
-        print_master("Starting CIRR evaluation...")
-        
-        # Set model to eval mode
-        self.model.eval()
-        
-        try:
-            # Encode all candidate images
-            candidate_embeddings = self._encode_images(self.candidate_images)
-            candidate_embeddings = F.normalize(candidate_embeddings, p=2, dim=1)
-            
-            # Encode all composed queries
-            query_embeddings = self._encode_composed_queries(self.test_data)
-            query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
-            
-            # Compute similarities
-            print_master("Computing similarities...")
-            similarities = torch.mm(query_embeddings, candidate_embeddings.t())  # [num_queries, num_candidates]
-            
-            # Compute metrics using similarities (not rankings)
-            metrics = self._compute_recall_metrics(similarities)
-            
-            print_master("Evaluation completed!")
-            return metrics
-            
-        except Exception as e:
-            print_master(f"Evaluation failed: {e}")
-            import traceback
-            print_master(f"Traceback: {traceback.format_exc()}")
-            # Return dummy metrics on failure
-            return {'r_at_1': 0.1, 'r_at_5': 0.3, 'r_at_10': 0.4}
+        return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0, 512, device=self.device)
     
     def _compute_recall_metrics(self, similarities: torch.Tensor) -> Dict[str, float]:
         """
