@@ -555,11 +555,14 @@ class CIRREvaluator:
         if dist.is_initialized():
             rank = dist.get_rank()
             desc = f"Rank {rank}: Encoding images"
+            # Only show progress bar on rank 0 to avoid cluttered output
+            disable_tqdm = (rank != 0)
         else:
             desc = "Encoding images"
+            disable_tqdm = False
         
         # Process in batches
-        for i in tqdm(range(0, len(image_names), self.batch_size), desc=desc):
+        for i in tqdm(range(0, len(image_names), self.batch_size), desc=desc, disable=disable_tqdm):
             batch_names = image_names[i:i+self.batch_size]
             batch_images = [self._load_image(name) for name in batch_names]
             
@@ -598,11 +601,14 @@ class CIRREvaluator:
         if dist.is_initialized():
             rank = dist.get_rank()
             desc = f"Rank {rank}: Encoding queries"
+            # Only show progress bar on rank 0 to avoid cluttered output
+            disable_tqdm = (rank != 0)
         else:
             desc = "Encoding queries"
+            disable_tqdm = False
         
         # Process in batches
-        for i in tqdm(range(0, len(queries), self.batch_size), desc=desc):
+        for i in tqdm(range(0, len(queries), self.batch_size), desc=desc, disable=disable_tqdm):
             batch_queries = queries[i:i+self.batch_size]
             
             # Prepare batch - use correct CIRR key names

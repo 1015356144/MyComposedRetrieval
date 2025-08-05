@@ -1,4 +1,4 @@
-# CIRR Dataset Configuration for Iterative Training
+# CIRR Dataset Configuration for Iterative Training - PRODUCTION MODE
 
 CIRR:
     dataset_parser: IterativeCIRRDataset
@@ -8,27 +8,30 @@ CIRR:
     image_base_dir: /home/guohaiyun/yty_data/CIRR  # base directory for images
     captions_file: /home/guohaiyun/yty_data/CIRR/cirr/captions/cap.rc2.train.json  # captions file
     image_splits_file: /home/guohaiyun/yty_data/CIRR/cirr/image_splits/split.rc2.train.json  # ALL candidate images for retrieval (硬负样本挖掘的候选图像集)
-    num_sample_per_subset: 1000  # reduced for testing
+    num_sample_per_subset: -1  # Use all samples for production
     weight: 1.0
     
-    # Iterative training specific configs
-    max_iterations: 2  # reduced for testing
+    # Iterative training specific configs - PRODUCTION
+    max_iterations: 3  # Full iterative training cycles
     hard_neg_collection_freq: 1
     hard_neg_top_k: 10
-    caption_generation_batch_size: 4  # reduced for testing
+    caption_generation_batch_size: 16  # Increased for 8-GPU production
     
-    # Fast mode for testing (significantly reduces computation)
-    fast_mode: true
-    fast_mode_max_samples: 100  # Only process 100 samples for hard negatives
-    fast_mode_retrieval_db_size: 50  # Only use 50 images in retrieval database
-    fast_mode_max_steps: 5  # Only train for 5 steps per iteration
+    # Production mode settings - ENABLED
+    fast_mode: false  # Disable fast mode for production
+    production_max_steps: 8822  # ~5 epochs with batch_size=16 (28225 / 16 * 5 = 8820)
+    production_save_steps: 3000   # Save 2-3 times per iteration (~every 2.9k steps for 8.8k total)
+    production_eval_steps: 1000  # Evaluate every 1000 steps
+    production_logging_steps: 50  # Log every 50 steps
     
-    # Production mode settings (uncomment for real training)
-    # fast_mode: false
-    # production_max_steps: 1000  # Steps per iteration in production
-    # production_save_steps: 100  # Save frequency in production
+    # Fast mode settings - COMMENTED OUT (kept for reference)
+    # fast_mode: true  # Quick testing mode
+    # fast_max_steps: 50  # Minimal steps for testing
+    # fast_save_steps: 20  # Frequent saves for debugging
+    # fast_eval_steps: 25  # Quick evaluation
+    # fast_logging_steps: 5  # Verbose logging for debugging
     
-    # Foundation model for caption generation
-    foundation_model_name: "Qwen/Qwen2-VL-2B-Instruct"  # or your preferred foundation model
+    # Foundation model for caption generation - Qwen2VL-7B
+    foundation_model_name: "/home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-7B-Instruct"
     foundation_model_temperature: 0.7
-    foundation_model_max_length: 100
+    foundation_model_max_length: 128  # Increased for better quality

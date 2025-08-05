@@ -114,6 +114,20 @@ class MMEBModel(nn.Module):
             reps = torch.nn.functional.normalize(reps, p=2, dim=-1)
         return reps
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Enable gradient checkpointing by delegating to the underlying encoder model.
+        This is needed when using --gradient_checkpointing True in training.
+        """
+        if hasattr(self.encoder, 'gradient_checkpointing_enable'):
+            self.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        else:
+            # Fallback for models that don't have this method
+            if hasattr(self.encoder, 'config'):
+                self.encoder.config.use_cache = False
+            if hasattr(self.encoder, 'gradient_checkpointing'):
+                self.encoder.gradient_checkpointing = True
+
     @classmethod
     def build(cls, model_args: ModelArguments, **kwargs):
         config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)

@@ -10,6 +10,7 @@ import random
 import re
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 import numpy as np
 import traceback
 from PIL import Image
@@ -221,6 +222,88 @@ class IterativeCIRRDataset(Dataset):
         else:
             print_rank(f"No hard negatives cache found for iteration {iteration_round-1}")
     
+    def collect_hard_negatives_batch(self, retrieval_model, batch_size: int = 8, max_samples: int = None):
+        """
+        单卡硬负样本收集方法
+        
+        Args:
+            retrieval_model: 检索模型
+            batch_size: 批次大小
+            max_samples: 最大样本数（用于fast mode）
+        """
+        print_rank(f"Starting single-GPU hard negative collection for iteration {self.iteration_round}")
+        
+        # 检查是否已有缓存
+        if os.path.exists(self.hard_negatives_file):
+            print_rank(f"Loading existing hard negatives from {self.hard_negatives_file}")
+            with open(self.hard_negatives_file, 'r') as f:
+                hard_negatives = json.load(f)
+            
+            # 应用max_samples限制
+            if max_samples is not None and len(hard_negatives) > max_samples:
+                hard_negatives = hard_negatives[:max_samples]
+            
+            self.hard_negatives_cache = hard_negatives
+            print_rank(f"Loaded {len(hard_negatives)} existing hard negatives")
+            return hard_negatives
+        
+        retrieval_model.eval()
+        
+        # 1. 确定样本范围
+        if max_samples is not None:
+            sample_limit = min(max_samples, len(self.annotations))
+            print_rank(f"Using max_samples limit: {sample_limit}")
+        else:
+            sample_limit = len(self.annotations)
+            print_rank(f"Processing all {sample_limit} samples")
+        
+        sample_annotations = self.annotations[:sample_limit]
+        
+        # 2. 预计算target embeddings（单卡模式）
+        target_embeddings = self._get_or_compute_target_embeddings(
+            self.retrieval_candidates, retrieval_model,
+            getattr(retrieval_model, 'processor', None),
+            getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
+            next(retrieval_model.parameters()).device
+        )
+        
+        # 3. 处理所有查询
+        all_hard_negatives = []
+        with torch.no_grad():
+            for i in range(0, len(sample_annotations), batch_size):
+                batch_annotations = sample_annotations[i:i+batch_size]
+                
+                print_rank(f"Processing batch {i//batch_size + 1}/{(len(sample_annotations) + batch_size - 1)//batch_size}")
+                
+                # 转换为检索格式
+                batch = []
+                for ann in batch_annotations:
+                    batch.append({
+                        'reference_image': self.image_splits.get(ann['reference'], ann['reference']),
+                        'modification_text': ann['caption'],
+                        'target_image': self.image_splits.get(ann['target_hard'], ann['target_hard'])
+                    })
+                
+                # 运行检索
+                retrieval_results = self._run_real_retrieval_with_cached_targets(
+                    retrieval_model, batch, target_embeddings, max_samples
+                )
+                
+                # 识别硬负样本
+                batch_hard_negs = self._identify_hard_negatives(batch, retrieval_results)
+                all_hard_negatives.extend(batch_hard_negs)
+        
+        print_rank(f"Collected {len(all_hard_negatives)} total hard negatives")
+        
+        # 4. 保存到文件
+        with open(self.hard_negatives_file, 'w') as f:
+            json.dump(all_hard_negatives, f, indent=2)
+        
+        print_rank(f"✅ Saved hard negatives to {self.hard_negatives_file}")
+        self.hard_negatives_cache = all_hard_negatives
+        
+        return all_hard_negatives
+
     def collect_hard_negatives_batch_distributed(self, retrieval_model, batch_size: int = 8, max_samples: int = None):
         """
         多卡并行的硬负样本收集
@@ -296,7 +379,11 @@ class IterativeCIRRDataset(Dataset):
                 for i in range(0, len(local_annotations), batch_size):
                     batch_annotations = local_annotations[i:i+batch_size]
                     
-                    print_rank(f"GPU {rank}: Processing batch {i//batch_size + 1}/{(len(local_annotations) + batch_size - 1)//batch_size}")
+                    # 只有rank 0打印批次进度，避免输出混乱
+                    if rank == 0:
+                        batch_num = i//batch_size + 1
+                        total_batches = (len(local_annotations) + batch_size - 1)//batch_size
+                        print_rank(f"🔍 Processing hard negative batch {batch_num}/{total_batches}")
                     
                     # 转换为检索格式
                     batch = []
@@ -577,8 +664,8 @@ class IterativeCIRRDataset(Dataset):
     
     def _get_or_compute_target_embeddings_distributed(self, model):
         """
-        分布式环境下获取或计算target embeddings - 高效实现
-        使用网络广播而不是磁盘IO来分发embeddings
+        分布式环境下获取或计算target embeddings - 真正的并行化实现
+        使用"并行计算-聚合"模式，所有GPU都参与计算
         
         Args:
             model: 检索模型
@@ -598,9 +685,12 @@ class IterativeCIRRDataset(Dataset):
             )
         
         rank = dist.get_rank()
+        world_size = dist.get_world_size()
         device = next(model.parameters()).device
         
-        # 先尝试从缓存加载（避免重复计算）
+        print_rank(f"GPU {rank}: Starting distributed target embeddings computation")
+        
+        # 先尝试从缓存加载（所有GPU都检查缓存）
         cache_file = self._get_cache_file_path(self.retrieval_candidates)
         
         if os.path.exists(cache_file):
@@ -619,42 +709,178 @@ class IterativeCIRRDataset(Dataset):
             except Exception as e:
                 print_rank(f"GPU {rank}: Error loading cache: {e}, will recompute")
         
-        # 只有rank 0计算embeddings
-        if rank == 0:
-            print_rank("Computing target embeddings on rank 0...")
-            embeddings = self._get_or_compute_target_embeddings(
-                self.retrieval_candidates, model,
+        # 缓存不存在或无效，进行分布式计算
+        print_rank(f"Starting distributed target embeddings computation across {world_size} GPUs")
+        
+        # 1. 分配计算任务：将候选图像分割到各个GPU
+        total_candidates = len(self.retrieval_candidates)
+        candidates_per_gpu = (total_candidates + world_size - 1) // world_size
+        start_idx = rank * candidates_per_gpu
+        end_idx = min(start_idx + candidates_per_gpu, total_candidates)
+        
+        local_candidates = self.retrieval_candidates[start_idx:end_idx]
+        print_rank(f"GPU {rank}: Computing embeddings for candidates {start_idx}-{end_idx-1} ({len(local_candidates)} images)")
+        
+        # 2. 每个GPU计算自己分配的候选图像embeddings
+        if len(local_candidates) > 0:
+            local_embeddings = self._compute_target_embeddings_batch_local(
+                local_candidates, model, 
                 getattr(model, 'processor', None),
                 getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
-                device
+                device, rank
             )
-            print_rank(f"Rank 0: Computed embeddings shape: {embeddings.shape}")
         else:
-            # 其他GPU创建占位符tensor
-            embeddings = None
+            # 创建空tensor（保持一致的维度）
+            local_embeddings = torch.empty(0, 768, device=device)  # 假设768维
         
-        # 使用广播分发embeddings（更高效的分布式方式）
+        # 3. 同步屏障：确保所有GPU完成各自的计算
+        dist.barrier()
+        print_rank(f"GPU {rank}: Completed local computation, starting all-gather")
+        
+        # 4. 收集所有GPU的embeddings结果
+        # 首先收集embedding维度信息
+        if local_embeddings.numel() > 0:
+            embedding_dim = local_embeddings.size(1)
+        else:
+            embedding_dim = 768  # 默认维度
+        
+        # 广播真实的embedding维度（从第一个有数据的GPU）
+        dim_tensor = torch.tensor([embedding_dim], dtype=torch.long, device=device)
+        if rank == 0 and local_embeddings.numel() > 0:
+            # rank 0有数据时，使用其维度
+            pass
+        else:
+            # 寻找第一个有数据的GPU来确定维度
+            for r in range(world_size):
+                if r == rank and local_embeddings.numel() > 0:
+                    dim_tensor[0] = embedding_dim
+                    break
+        
+        # 找到有数据的第一个GPU并广播维度
+        for source_rank in range(world_size):
+            try:
+                dist.broadcast(dim_tensor, src=source_rank)
+                embedding_dim = dim_tensor.item()
+                if embedding_dim > 0:
+                    break
+            except:
+                continue
+        
+        # 5. 准备用于all-gather的tensor
+        max_local_candidates = candidates_per_gpu
+        padded_embeddings = torch.zeros(max_local_candidates, embedding_dim, device=device)
+        actual_local_size = local_embeddings.size(0)
+        if actual_local_size > 0:
+            padded_embeddings[:actual_local_size] = local_embeddings
+        
+        # 6. All-gather收集所有GPU的embeddings
+        embedding_list = [torch.zeros_like(padded_embeddings) for _ in range(world_size)]
+        dist.all_gather(embedding_list, padded_embeddings)
+        
+        # 7. 重建完整的embeddings矩阵
+        all_embeddings = []
+        for i, emb in enumerate(embedding_list):
+            gpu_start = i * candidates_per_gpu
+            gpu_end = min(gpu_start + candidates_per_gpu, total_candidates)
+            actual_size = gpu_end - gpu_start
+            if actual_size > 0:
+                all_embeddings.append(emb[:actual_size])
+        
+        full_embeddings = torch.cat(all_embeddings, dim=0)
+        print_rank(f"GPU {rank}: ✅ Reconstructed {full_embeddings.size(0)} target embeddings via distributed computation")
+        
+        # 8. 只有rank 0保存缓存（避免并发写入冲突）
         if rank == 0:
-            # 广播embeddings的形状信息
-            shape_info = [embeddings.size(0), embeddings.size(1)]
+            try:
+                cache_data = {
+                    'target_paths': self.retrieval_candidates,
+                    'embeddings': full_embeddings.cpu(),
+                    'timestamp': time.time(),
+                    'model_backbone': getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
+                    'computed_by': 'distributed'
+                }
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                torch.save(cache_data, cache_file)
+                print_rank(f"💾 Cached distributed target embeddings to {cache_file}")
+            except Exception as e:
+                print_rank(f"Warning: Failed to cache embeddings: {e}")
+        
+        # 9. 最终同步，确保所有GPU都有相同的结果
+        dist.barrier()
+        
+        return full_embeddings
+    
+    def _compute_target_embeddings_batch_local(self, target_candidates, model, processor, model_backbone, device, rank=0):
+        """
+        在单个GPU上计算target embeddings的子集（用于分布式计算）
+        
+        Args:
+            target_candidates: 分配给当前GPU的候选图像列表
+            model: 编码模型
+            processor: 模型processor
+            model_backbone: 模型backbone名称
+            device: 设备
+            rank: GPU编号（用于日志）
+            
+        Returns:
+            当前GPU计算的embeddings tensor
+        """
+        import time
+        
+        target_embeddings = []
+        target_batch_size = 8  # 小批次以避免内存问题
+        total_batches = (len(target_candidates) + target_batch_size - 1) // target_batch_size
+        
+        print_rank(f"GPU {rank}: Computing embeddings for {len(target_candidates)} images in {total_batches} batches...")
+        start_time = time.time()
+        
+        with torch.no_grad():
+            for i in range(0, len(target_candidates), target_batch_size):
+                batch_idx = i // target_batch_size + 1
+                batch_targets = target_candidates[i:i+target_batch_size]
+                
+                # 计算进度和ETA
+                # 只有rank 0打印详细进度，避免输出混乱
+                if rank == 0:
+                    if batch_idx > 1:
+                        elapsed = time.time() - start_time
+                        avg_time_per_batch = elapsed / (batch_idx - 1)
+                        remaining_batches = total_batches - batch_idx + 1
+                        eta_seconds = avg_time_per_batch * remaining_batches
+                        eta_str = f"ETA: {int(eta_seconds//60):02d}:{int(eta_seconds%60):02d}"
+                        progress_pct = (batch_idx - 1) / total_batches * 100
+                    else:
+                        eta_str = "ETA: calculating..."
+                        progress_pct = 0
+                    
+                    print_rank(f"  📊 Batch {batch_idx:4d}/{total_batches} ({progress_pct:5.1f}%) - Processing {len(batch_targets)} images - {eta_str}")
+                
+                # 创建target输入（仅图片）
+                target_inputs = self._prepare_target_inputs(batch_targets, processor, model_backbone, device)
+                
+                try:
+                    target_embs = model.encode_input(target_inputs)
+                    target_embs = self._process_embeddings(target_embs, len(batch_targets), f"target_batch_{batch_idx}")
+                    target_embeddings.append(target_embs.cpu())
+                    
+                except Exception as e:
+                    print_rank(f"GPU {rank}: Error encoding target batch {batch_idx}: {e}")
+                    # 使用dummy embeddings作为fallback
+                    dummy_embs = torch.randn(len(batch_targets), 768)
+                    target_embeddings.append(dummy_embs)
+        
+        total_time = time.time() - start_time
+        print_rank(f"GPU {rank}: ✅ Local embeddings computation completed in {int(total_time//60):02d}:{int(total_time%60):02d}")
+        print_rank(f"GPU {rank}: Average speed: {len(target_candidates)/total_time:.1f} images/second")
+        
+        # 连接所有target embeddings
+        if target_embeddings:
+            final_embeddings = torch.cat(target_embeddings, dim=0)
+            print_rank(f"GPU {rank}: Final local embeddings shape: {final_embeddings.shape}")
+            return final_embeddings.to(device)
         else:
-            shape_info = [0, 0]
-        
-        dist.broadcast_object_list(shape_info, src=0)
-        
-        # 其他GPU创建相同形状的tensor用于接收
-        if rank != 0:
-            embeddings = torch.zeros(shape_info[0], shape_info[1], dtype=torch.float32, device=device)
-        else:
-            # 确保rank 0的embeddings也在正确的设备上
-            embeddings = embeddings.to(device)
-        
-        # 广播embeddings数据（确保所有tensor都在GPU上）
-        dist.broadcast(embeddings, src=0)
-        
-        print_rank(f"GPU {rank}: ✅ Received target embeddings via broadcast: {embeddings.shape}")
-        
-        return embeddings
+            # 返回空tensor
+            return torch.empty(0, 768, device=device)
     
     def _run_real_retrieval_with_cached_targets(self, model, batch, target_embeddings, max_samples=None):
         """
@@ -1210,30 +1436,38 @@ class IterativeCIRRDataset(Dataset):
                 batch_idx = i // batch_size + 1
                 batch_hard_negs = local_hard_negatives[i:i+batch_size]
                 
-                # 计算ETA
-                if batch_idx > 1:
-                    elapsed = time.time() - start_time
-                    avg_time_per_batch = elapsed / (batch_idx - 1)
-                    remaining_batches = total_batches - batch_idx + 1
-                    eta_seconds = avg_time_per_batch * remaining_batches
-                    eta_str = f"ETA: {int(eta_seconds//60):02d}:{int(eta_seconds%60):02d}"
-                else:
-                    eta_str = "ETA: calculating..."
-                
-                print_rank(f"GPU {rank}: Processing caption batch {batch_idx}/{total_batches} ({len(batch_hard_negs)} samples) - {eta_str}")
+                # 只有rank 0打印详细进度，避免输出混乱
+                if rank == 0:
+                    # 计算ETA
+                    if batch_idx > 1:
+                        elapsed = time.time() - start_time
+                        avg_time_per_batch = elapsed / (batch_idx - 1)
+                        remaining_batches = total_batches - batch_idx + 1
+                        eta_seconds = avg_time_per_batch * remaining_batches
+                        eta_str = f"ETA: {int(eta_seconds//60):02d}:{int(eta_seconds%60):02d}"
+                    else:
+                        eta_str = "ETA: calculating..."
+                    
+                    print_rank(f"🔄 Processing caption batch {batch_idx}/{total_batches} ({len(batch_hard_negs)} samples) - {eta_str}")
                 
                 try:
                     batch_start_time = time.time()
                     batch_augmented = self._generate_caption_batch_single_gpu(batch_hard_negs)
                     batch_time = time.time() - batch_start_time
                     local_augmented_samples.extend(batch_augmented)
-                    print_rank(f"GPU {rank}: Batch {batch_idx}/{total_batches} completed in {batch_time:.1f}s, generated {len(batch_augmented)} samples")
+                    
+                    # 只有rank 0打印批次完成信息
+                    if rank == 0:
+                        print_rank(f"✅ Batch {batch_idx}/{total_batches} completed in {batch_time:.1f}s, generated {len(batch_augmented)} samples")
                     
                 except Exception as e:
-                    print_rank(f"GPU {rank}: Error in batch {batch_idx}: {e}")
+                    # 错误信息所有GPU都打印，因为需要调试
+                    print_rank(f"❌ GPU {rank}: Error in batch {batch_idx}: {e}")
                     continue
         
-        print_rank(f"GPU {rank}: Generated {len(local_augmented_samples)} local augmented samples")
+        # 只有rank 0打印本地完成信息
+        if rank == 0:
+            print_rank(f"🎯 Local caption generation completed: {len(local_augmented_samples)} samples")
         
         # 3. 同步屏障：确保所有GPU完成生成
         dist.barrier()

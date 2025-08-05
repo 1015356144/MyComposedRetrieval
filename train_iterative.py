@@ -9,8 +9,8 @@ import os
 import os.path
 import sys
 
-# Disable wandb
-os.environ['WANDB_DISABLED'] = 'true'
+# Enable wandb for production training monitoring
+# os.environ['WANDB_DISABLED'] = 'true'  # Commented out to enable wandb
 
 logging.basicConfig(
     level=logging.INFO, format='[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s',

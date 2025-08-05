@@ -378,9 +378,10 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                              hasattr(self.evaluator, '_evaluate_distributed'))
             
             # In fast mode, prefer single GPU evaluation for simplicity unless many GPUs
-            if self.fast_mode and use_distributed and dist.get_world_size() <= 2:
+            # Modified: Allow distributed evaluation with 2+ GPUs even in fast mode
+            if self.fast_mode and use_distributed and dist.get_world_size() < 2:
                 use_distributed = False
-                print_master("Fast mode: Using single GPU evaluation for small GPU count")
+                print_master("Fast mode: Using single GPU evaluation for single GPU setup")
             
             if use_distributed:
                 print_master(f"Using distributed evaluation across {dist.get_world_size()} GPUs")
