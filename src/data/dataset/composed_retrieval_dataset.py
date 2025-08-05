@@ -474,17 +474,23 @@ class IterativeCIRRDataset(Dataset):
             # But still ensure we have enough candidates for meaningful hard negative mining
             min_candidates = min(1000, len(self.retrieval_candidates))  # At least 1000 or all available
             candidate_targets = self.retrieval_candidates[:min_candidates]
-            print_rank(f"Fast mode: using {len(candidate_targets)} target candidates (subset of {len(self.retrieval_candidates)})")
+            # 只有单卡模式或rank 0打印，避免分布式环境下的重复输出
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print_rank(f"Fast mode: using {len(candidate_targets)} target candidates (subset of {len(self.retrieval_candidates)})")
         else:
             # Production mode: use ALL available retrieval candidates
             # This is the correct approach for finding true hard negatives
             candidate_targets = self.retrieval_candidates
-            print_rank(f"Production mode: using full retrieval candidate set ({len(candidate_targets)} images)")
+            # 只有单卡模式或rank 0打印，避免分布式环境下的重复输出
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print_rank(f"Production mode: using full retrieval candidate set ({len(candidate_targets)} images)")
         
         target_database = candidate_targets
         target_paths = candidate_targets
         
-        print_rank(f"Retrieval database: {len(target_database)} target images")
+        # 只有单卡模式或rank 0打印，避免分布式环境下的重复输出
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print_rank(f"Retrieval database: {len(target_database)} target images")
         
         if len(target_database) == 0:
             raise Exception("No valid target images found")
@@ -538,7 +544,9 @@ class IterativeCIRRDataset(Dataset):
             "target_paths": target_paths  # Include actual target paths for reference
         }
         
-        print_rank(f"Real retrieval completed. Average top-1 similarity: {top_k_similarities[:, 0].mean():.4f}")
+        # 只有单卡模式或rank 0打印，避免分布式环境下的重复输出
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print_rank(f"Real retrieval completed. Average top-1 similarity: {top_k_similarities[:, 0].mean():.4f}")
         return results
     
     def _get_cache_file_path(self, target_database):
@@ -579,8 +587,14 @@ class IterativeCIRRDataset(Dataset):
                 # 验证缓存有效性
                 if (cached_data['target_paths'] == target_database and 
                     cached_data['embeddings'].size(0) == len(target_database)):
-                    print_rank(f"✅ Cache hit! Loaded {len(target_database)} target embeddings")
-                    return cached_data['embeddings']
+                    embeddings = cached_data['embeddings']
+                    
+                    # 确保数据类型与当前模型匹配
+                    model_dtype = next(model.parameters()).dtype
+                    embeddings = embeddings.to(dtype=model_dtype, device=device)
+                    
+                    print_rank(f"✅ Cache hit! Loaded {len(target_database)} target embeddings (dtype: {embeddings.dtype})")
+                    return embeddings
                 else:
                     print_rank("Cache validation failed, will recompute embeddings")
             except Exception as e:
@@ -702,7 +716,12 @@ class IterativeCIRRDataset(Dataset):
                 if (cached_data['target_paths'] == self.retrieval_candidates and 
                     cached_data['embeddings'].size(0) == len(self.retrieval_candidates)):
                     embeddings = cached_data['embeddings'].to(device)
-                    print_rank(f"GPU {rank}: ✅ Successfully loaded {embeddings.size(0)} target embeddings from cache")
+                    
+                    # 确保数据类型与当前模型匹配（通常是bfloat16）
+                    model_dtype = next(model.parameters()).dtype
+                    embeddings = embeddings.to(dtype=model_dtype)
+                    
+                    print_rank(f"GPU {rank}: ✅ Successfully loaded {embeddings.size(0)} target embeddings from cache (dtype: {embeddings.dtype})")
                     return embeddings
                 else:
                     print_rank(f"GPU {rank}: Cache validation failed, will recompute")
@@ -911,12 +930,16 @@ class IterativeCIRRDataset(Dataset):
             min_candidates = min(1000, len(self.retrieval_candidates))
             candidate_targets = self.retrieval_candidates[:min_candidates]
             used_target_embeddings = target_embeddings[:min_candidates].to(device)
-            print_rank(f"Fast mode: using {len(candidate_targets)} target candidates")
+            # 只有rank 0打印，避免分布式环境下的重复输出
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print_rank(f"Fast mode: using {len(candidate_targets)} target candidates")
         else:
             # Production mode: 使用完整集合
             candidate_targets = self.retrieval_candidates
             used_target_embeddings = target_embeddings.to(device)
-            print_rank(f"Production mode: using full candidate set ({len(candidate_targets)} images)")
+            # 只有rank 0打印，避免分布式环境下的重复输出
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print_rank(f"Production mode: using full candidate set ({len(candidate_targets)} images)")
         
         # 编码查询
         with torch.no_grad():
@@ -933,6 +956,9 @@ class IterativeCIRRDataset(Dataset):
         # 标准化embeddings
         query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
         used_target_embeddings = F.normalize(used_target_embeddings, p=2, dim=1)
+        
+        # 确保数据类型一致（统一使用query_embeddings的数据类型，通常是bfloat16）
+        used_target_embeddings = used_target_embeddings.to(query_embeddings.dtype)
         
         # 计算相似度
         similarities = torch.mm(query_embeddings, used_target_embeddings.t())
