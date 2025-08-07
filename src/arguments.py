@@ -54,6 +54,7 @@ class TrainingArguments(TrainingArguments):
     image_encoder_freeze: bool = field(default=False, metadata={"help": "huggingface model name"})
     output_dir: str = field(default=None, metadata={"help": "directory for saving trained models"})
     resume_from: str = field(default="none", metadata={"help": "`auto` will detect if any previous checkpoints should be resumed. or specify specific step of the checkpoint."})
+    resume_from_iteration: str = field(default="none", metadata={"help": "Resume from a specific iteration model: `auto`, `iter_0`, `iter_1`, etc. This loads model weights only without training state."})
     project_name: str = field(default=None, metadata={"help": "project name"})
     logging_dir: str = field(default=None, metadata={"help": "TensorBoard log directory, also enables train.log generation"})
     logging_steps: int = field(default=1, metadata={"help": "logging steps"})

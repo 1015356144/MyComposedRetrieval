@@ -336,7 +336,7 @@ class IterativeCIRRDataset(Dataset):
                 hard_negatives = []
             
             # 所有GPU从文件读取，避免broadcast
-            if dist.is_initialized() and rank != 0:
+            if dist.is_initialized() and dist.get_rank() != 0:
                 # 非rank 0 GPU等待文件存在，然后直接读取
                 wait_start = time.time()
                 while time.time() - wait_start < 30:  # 30秒等待
@@ -346,10 +346,10 @@ class IterativeCIRRDataset(Dataset):
                                 hard_negatives = json.load(f)
                             break
                         except Exception as e:
-                            print_rank(f"GPU {rank}: Error reading hard negatives file: {e}")
+                            print_rank(f"GPU {dist.get_rank()}: Error reading hard negatives file: {e}")
                     time.sleep(1)
                 else:
-                    print_rank(f"GPU {rank}: Timeout waiting for hard negatives file")
+                    print_rank(f"GPU {dist.get_rank()}: Timeout waiting for hard negatives file")
                     hard_negatives = []
             
             self.hard_negatives_cache = hard_negatives

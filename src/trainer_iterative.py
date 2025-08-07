@@ -39,21 +39,42 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                  fast_mode_max_samples: int = 100,
                  fast_mode_retrieval_db_size: int = 50,
                  fast_mode_max_steps: int = 5,
-                 production_max_steps: int = 1000,
+                 steps_per_iteration: int = 1000,  # 新参数名：每轮迭代的步数
                  production_save_steps: int = 100,
+                 # 保持向后兼容性
+                 production_max_steps: Optional[int] = None,  # 旧参数名，用于向后兼容
                  **kwargs):
         # Store model_args, data_args and max_length before calling super().__init__()
         self.model_args = model_args
         self.data_args = data_args
         self.max_length = max_length
         
+        # Handle parameter compatibility: steps_per_iteration vs production_max_steps
+        if production_max_steps is not None:
+            # 向后兼容：如果传入了旧参数名，使用它并发出警告
+            print_master("⚠️  WARNING: 'production_max_steps' is deprecated, use 'steps_per_iteration' instead")
+            self.production_max_steps = production_max_steps
+        else:
+            # 使用新参数名
+            self.production_max_steps = steps_per_iteration
+        
         # Store fast mode and production mode settings
         self.fast_mode = fast_mode
         self.fast_mode_max_samples = fast_mode_max_samples
         self.fast_mode_retrieval_db_size = fast_mode_retrieval_db_size
         self.fast_mode_max_steps = fast_mode_max_steps
-        self.production_max_steps = production_max_steps
+        # self.production_max_steps 已经在上面设置了
         self.production_save_steps = production_save_steps
+        
+        # 🔧 计算迭代训练的步数规划
+        if self.fast_mode:
+            self.steps_per_iteration = self.fast_mode_max_steps
+        else:
+            self.steps_per_iteration = self.production_max_steps
+        
+        # 关键：计算总的训练步数用于学习率调度器
+        self.total_planned_steps = max_iterations * self.steps_per_iteration
+        print_master(f"📋 Training plan: {max_iterations} iterations × {self.steps_per_iteration} steps = {self.total_planned_steps} total steps")
         
         # Remove parameters that parent Trainer doesn't accept
         kwargs.pop('model_args', None)
@@ -63,7 +84,8 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         kwargs.pop('fast_mode_max_samples', None)
         kwargs.pop('fast_mode_retrieval_db_size', None)
         kwargs.pop('fast_mode_max_steps', None)
-        kwargs.pop('production_max_steps', None)
+        kwargs.pop('steps_per_iteration', None)  # 新参数名
+        kwargs.pop('production_max_steps', None)  # 旧参数名，向后兼容
         kwargs.pop('production_save_steps', None)
         
         super().__init__(**kwargs)
@@ -131,31 +153,36 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         """Configure training parameters based on fast mode or production mode"""
         # Debug: Print fast_mode value
         print_master(f"DEBUG: self.fast_mode = {self.fast_mode}")
-        print_master(f"DEBUG: fast_mode_max_steps = {self.fast_mode_max_steps}")
+        print_master(f"DEBUG: steps_per_iteration = {self.steps_per_iteration}")
         
         if self.fast_mode:
             print_master("=== FAST MODE CONFIGURATION ===")
-            print_master(f"Max steps per iteration: {self.fast_mode_max_steps}")
+            print_master(f"Steps per iteration: {self.steps_per_iteration}")
             print_master(f"Max samples for hard negatives: {self.fast_mode_max_samples}")
             print_master(f"Retrieval database size: {self.fast_mode_retrieval_db_size}")
             
-            # Override training arguments for fast mode
-            self.args.max_steps = self.fast_mode_max_steps
-            self.args.save_steps = max(1, self.fast_mode_max_steps // 2)  # Save in the middle
+            # 配置保存和日志频率
+            self.args.save_steps = max(1, self.steps_per_iteration // 2)  # Save in the middle
             self.args.logging_steps = 1
             
         else:
             print_master("=== PRODUCTION MODE CONFIGURATION ===")
-            print_master(f"Max steps per iteration: {self.production_max_steps}")
+            print_master(f"Steps per iteration: {self.steps_per_iteration}")
             print_master(f"Save frequency: every {self.production_save_steps} steps")
             
-            # Override training arguments for production mode
-            self.args.max_steps = self.production_max_steps
+            # 配置保存和日志频率
             self.args.save_steps = self.production_save_steps
             self.args.logging_steps = min(10, self.production_save_steps // 10)
         
+        # 🔧 关键修改：使用总的计划步数初始化学习率调度器
+        # 这确保了调度器从一开始就知道整个训练的"蓝图"
+        print_master(f"🎯 Setting max_steps for LR scheduler: {self.total_planned_steps}")
+        print_master(f"   ➡️ LR scheduler will plan decay over full {self.max_iterations} iterations")
+        self.args.max_steps = self.total_planned_steps
+        
         print_master(f"Final training configuration:")
-        print_master(f"  max_steps: {self.args.max_steps}")
+        print_master(f"  total_planned_steps: {self.total_planned_steps}")
+        print_master(f"  steps_per_iteration: {self.steps_per_iteration}")
         print_master(f"  save_steps: {self.args.save_steps}")
         print_master(f"  logging_steps: {self.args.logging_steps}")
         print_master("=" * 50)
@@ -324,11 +351,11 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     self._train_base_model()
                 else:
                     print_master(f"Iteration {iteration}: Training with augmented data...")
-                    # 🔧 验证训练状态连续性
-                    if not self._verify_training_state_continuity():
-                        print_master("‼️ Training state verification failed - proceeding with caution")
-                    
                     self._train_current_iteration()
+                    
+                    # 🔧 验证训练状态连续性（在checkpoint加载后）
+                    if not self._verify_training_state_continuity():
+                        print_master("‼️ Training state verification failed - but training completed successfully")
                 
                 # 添加同步屏障：确保所有GPU完成训练
                 if dist.is_initialized():
@@ -439,19 +466,25 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         self.train_dataset = self.original_dataset
         self._update_train_dataloader()
         
-        # 设置第0次迭代的目标步数
-        if self.fast_mode:
-            target_steps = self.fast_mode_max_steps
-        else:
-            target_steps = self.production_max_steps
+        # 🔧 临时覆盖机制：为本次迭代设置停止点
+        original_max_steps = self.args.max_steps  # 保存总的计划步数
+        iteration_stop_point = self.steps_per_iteration
         
-        self.args.max_steps = target_steps
-        print_master(f"Base model target steps: {target_steps}")
-        print_master("Starting fresh training for base model")
+        print_master(f"🎯 Base model training plan:")
+        print_master(f"   - This iteration: 0 → {iteration_stop_point} steps")
+        print_master(f"   - Total planned: {original_max_steps} steps")
+        print_master(f"   - LR scheduler knows about all {original_max_steps} steps")
         
-        # Standard training - HuggingFace Trainer处理一切
-        # 对于base model，不需要resume_from_checkpoint，因为这是第一次训练
-        train_result = self.train(resume_from_checkpoint=None)
+        # 临时设置为本次迭代的停止点
+        self.args.max_steps = iteration_stop_point
+        
+        try:
+            # Standard training - HuggingFace Trainer处理一切
+            train_result = self.train(resume_from_checkpoint=None)
+        finally:
+            # 🔧 关键：无论成功还是失败，都要恢复原始的总步数
+            self.args.max_steps = original_max_steps
+            print_master(f"✅ Restored max_steps to total planned: {original_max_steps}")
         
         # Save base model
         base_model_path = os.path.join(self.args.output_dir, "base_model")
@@ -469,24 +502,18 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         # 确保训练器使用最新的数据集
         self._update_train_dataloader()
         
-        # 计算当前迭代的目标步数
-        # HuggingFace Trainer会自动从当前global_step继续到max_steps
+        # 🔧 临时覆盖机制：计算本次迭代的停止点
         current_global_step = getattr(self.state, 'global_step', 0)
+        iteration_stop_point = current_global_step + self.steps_per_iteration
+        original_max_steps = self.args.max_steps  # 保存总的计划步数
         
-        if self.fast_mode:
-            steps_per_iteration = self.fast_mode_max_steps
-        else:
-            steps_per_iteration = self.production_max_steps
+        print_master(f"🎯 Iteration {self.current_iteration} training plan:")
+        print_master(f"   - Current step: {current_global_step}")
+        print_master(f"   - This iteration: {current_global_step} → {iteration_stop_point} steps")
+        print_master(f"   - Total planned: {original_max_steps} steps")
+        print_master(f"   - LR scheduler progress: {current_global_step}/{original_max_steps} ({current_global_step/original_max_steps*100:.1f}%)")
         
-        # 设置新的max_steps目标
-        new_max_steps = current_global_step + steps_per_iteration
-        old_max_steps = self.args.max_steps
-        self.args.max_steps = new_max_steps
-        
-        print_master(f"Current global step: {current_global_step}")
-        print_master(f"Target max_steps: {new_max_steps} (adding {steps_per_iteration} steps)")
-        
-        # ❗️ 关键修复：找到最新的检查点并从中恢复完整训练状态 ❗️
+        # ❗️ 找到最新的检查点
         from transformers.trainer_utils import get_last_checkpoint
         latest_checkpoint = get_last_checkpoint(self.args.output_dir)
         
@@ -499,8 +526,16 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         else:
             print_master("🆕 Starting fresh training (iteration 0)")
         
-        # 显式地从最新检查点恢复，这将加载模型、优化器、调度器和训练状态
-        train_result = self.train(resume_from_checkpoint=latest_checkpoint)
+        # 临时设置为本次迭代的停止点
+        self.args.max_steps = iteration_stop_point
+        
+        try:
+            # 显式地从最新检查点恢复，这将加载模型、优化器、调度器和训练状态
+            train_result = self.train(resume_from_checkpoint=latest_checkpoint)
+        finally:
+            # 🔧 关键：无论成功还是失败，都要恢复原始的总步数
+            self.args.max_steps = original_max_steps
+            print_master(f"✅ Restored max_steps to total planned: {original_max_steps}")
         
         print_master(f"Training completed: {current_global_step} → {self.state.global_step} steps")
         
@@ -1106,7 +1141,8 @@ def create_iterative_trainer(
     # Extract fast mode and production mode parameters
     fast_mode_params = {}
     for key in ['fast_mode', 'fast_mode_max_samples', 'fast_mode_retrieval_db_size', 
-                'fast_mode_max_steps', 'production_max_steps', 'production_save_steps']:
+                'fast_mode_max_steps', 'steps_per_iteration', 'production_save_steps',
+                'production_max_steps']:  # 保持向后兼容
         if key in kwargs:
             fast_mode_params[key] = kwargs.pop(key)
     

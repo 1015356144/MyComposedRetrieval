@@ -107,18 +107,7 @@ def main():
             print(f"torch.distributed.get_rank(): {torch.distributed.get_rank()}")
             print(f"torch.distributed.get_world_size(): {torch.distributed.get_world_size()}")
 
-    # Check for existing checkpoints
-    resume_checkpoint_dir = None
-    if training_args.resume_from == 'auto':
-        resume_checkpoint_dir = find_latest_checkpoint(training_args.output_dir)
-        if resume_checkpoint_dir:
-            logger.info(f"Resuming from checkpoint: {resume_checkpoint_dir}")
-    elif training_args.resume_from.isdigit():
-        resume_checkpoint_dir = os.path.join(training_args.output_dir, f'checkpoint-{training_args.resume_from}')
-        if os.path.exists(resume_checkpoint_dir):
-            logger.info(f"Resuming from checkpoint: {resume_checkpoint_dir}")
-    else:
-        logger.info("No checkpoint found. Starting fresh training.")
+    # Check for existing checkpoints (removed - now handled by new recovery system)
 
     # Set up logging_dir for train.log generation if not specified
     if not training_args.logging_dir:
@@ -153,9 +142,37 @@ def main():
         setattr(training_args, 'model_backbone', model_backbone)
     print_master(f'Model backbone: {model_args.model_backbone}')
     
-    # Check for iterative training checkpoints
+    # ================================
+    # 重新设计的恢复机制 - 分离两种不同的恢复方式
+    # ================================
+    
+    print_master("=" * 60)
+    print_master("CHECKPOINT RECOVERY SYSTEM")
+    print_master("=" * 60)
+    
+    # 1. Trainer checkpoint恢复 (包含optimizer/scheduler state)
+    trainer_checkpoint = None
+    if training_args.resume_from == 'auto':
+        trainer_checkpoint = find_latest_checkpoint(training_args.output_dir)
+        if trainer_checkpoint:
+            print_master(f"📁 Found trainer checkpoint: {trainer_checkpoint}")
+            print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+        else:
+            print_master("📁 No trainer checkpoint found")
+    elif training_args.resume_from.isdigit():
+        trainer_checkpoint = os.path.join(training_args.output_dir, f'checkpoint-{training_args.resume_from}')
+        if os.path.exists(trainer_checkpoint):
+            print_master(f"📁 Using specified trainer checkpoint: {trainer_checkpoint}")
+            print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+        else:
+            print_master(f"📁 Specified trainer checkpoint not found: {trainer_checkpoint}")
+            trainer_checkpoint = None
+    elif training_args.resume_from != 'none':
+        print_master(f"⚠️  Unknown resume_from format: {training_args.resume_from}")
+    
+    # 2. 迭代模型恢复 (只包含模型权重)
+    iteration_model = None
     resume_from_iteration = None
-    model_checkpoint_path = None
     
     def check_iteration_complete(output_dir, iteration, max_iterations):
         """Check if an iteration is completely finished"""
@@ -170,24 +187,23 @@ def main():
         except:
             return False
     
-    if training_args.resume_from == 'auto':
-        # Auto-detect latest COMPLETE iteration checkpoint
-        # First check for complete iterations (highest to lowest)
-        for i in range(10, -1, -1):  # Check iterations 0-10
+    if training_args.resume_from_iteration == 'auto':
+        # 自动检测最新的完整迭代
+        for i in range(10, -1, -1):
             if i == 0:
-                # Special case for iteration 0 -> base_model
                 model_path = os.path.join(training_args.output_dir, "base_model")
             else:
                 model_path = os.path.join(training_args.output_dir, f"iteration_{i}")
             
             if os.path.exists(model_path) and check_iteration_complete(training_args.output_dir, i, 10):
                 resume_from_iteration = i
-                model_checkpoint_path = model_path
-                print_master(f"Found COMPLETE iteration {i} checkpoint: {model_path}")
+                iteration_model = model_path
+                print_master(f"🎯 Found COMPLETE iteration {i} model: {model_path}")
+                print_master(f"   ⚠️  Contains: model weights only (no optimizer/scheduler)")
                 break
-        
-        # If no complete iterations found, look for incomplete iterations
-        if resume_from_iteration is None:
+                
+        # 如果没有完整的迭代，找最新的不完整迭代
+        if iteration_model is None:
             for i in range(10, -1, -1):
                 if i == 0:
                     model_path = os.path.join(training_args.output_dir, "base_model")
@@ -196,61 +212,109 @@ def main():
                 
                 if os.path.exists(model_path):
                     resume_from_iteration = i
-                    model_checkpoint_path = model_path
-                    print_master(f"Found INCOMPLETE iteration {i} checkpoint: {model_path}")
+                    iteration_model = model_path
+                    print_master(f"🎯 Found INCOMPLETE iteration {i} model: {model_path}")
+                    print_master(f"   ⚠️  Contains: model weights only (no optimizer/scheduler)")
                     break
-                
-    elif training_args.resume_from.startswith('iter_'):
-        # Manual iteration specification: iter_2
-        iter_num = training_args.resume_from.split('_')[1]
-        if iter_num.isdigit():
-            iter_num = int(iter_num)
+                    
+    elif training_args.resume_from_iteration.startswith('iter_'):
+        # 手动指定迭代
+        iter_num_str = training_args.resume_from_iteration.split('_')[1]
+        if iter_num_str.isdigit():
+            iter_num = int(iter_num_str)
             if iter_num == 0:
-                # Special case for iteration 0 -> base_model
-                iter_checkpoint = os.path.join(training_args.output_dir, "base_model")
+                model_path = os.path.join(training_args.output_dir, "base_model")
             else:
-                iter_checkpoint = os.path.join(training_args.output_dir, f"iteration_{iter_num}")
+                model_path = os.path.join(training_args.output_dir, f"iteration_{iter_num}")
             
-            if os.path.exists(iter_checkpoint):
+            if os.path.exists(model_path):
                 resume_from_iteration = iter_num
-                model_checkpoint_path = iter_checkpoint
+                iteration_model = model_path
                 complete_status = "COMPLETE" if check_iteration_complete(training_args.output_dir, iter_num, 10) else "INCOMPLETE"
-                print_master(f"Manually resuming from {complete_status} iteration {iter_num} at {iter_checkpoint}")
+                print_master(f"🎯 Using specified {complete_status} iteration {iter_num} model: {model_path}")
+                print_master(f"   ⚠️  Contains: model weights only (no optimizer/scheduler)")
+            else:
+                print_master(f"🎯 Specified iteration model not found: {model_path}")
+                
+    elif training_args.resume_from_iteration != 'none':
+        print_master(f"⚠️  Unknown resume_from_iteration format: {training_args.resume_from_iteration}")
     
-    # Unified model loading logic - load model only once
+    # 3. 决定恢复策略
+    print_master("-" * 60)
+    print_master("RECOVERY STRATEGY:")
+    
+    if trainer_checkpoint and iteration_model:
+        print_master("🔀 BOTH checkpoints found - using ITERATION model for weights")
+        print_master("   📋 Reason: Iteration models contain the latest trained weights")
+        print_master(f"   🎯 Model weights from: {iteration_model}")
+        print_master(f"   📁 Training state from: {trainer_checkpoint}")
+        use_iteration_for_weights = True
+        use_trainer_for_state = True
+    elif trainer_checkpoint:
+        print_master("📁 Using TRAINER checkpoint (complete recovery)")
+        print_master(f"   📁 Everything from: {trainer_checkpoint}")
+        use_iteration_for_weights = False
+        use_trainer_for_state = True
+    elif iteration_model:
+        print_master("🎯 Using ITERATION model (weights only)")
+        print_master(f"   🎯 Model weights from: {iteration_model}")
+        print_master("   ⚠️  No training state - will start fresh optimizer/scheduler")
+        use_iteration_for_weights = True
+        use_trainer_for_state = False
+    else:
+        print_master("🆕 No checkpoints found - starting from scratch")
+        use_iteration_for_weights = False
+        use_trainer_for_state = False
+    
+    print_master("=" * 60)
+    
+    # 4. 加载模型
     model = None
-    if model_checkpoint_path is not None:
-        # Try to load from iteration/base checkpoint first
-        print_master(f"Loading model from iteration checkpoint: {model_checkpoint_path}")
+    
+    if use_iteration_for_weights:
+        print_master(f"Loading model weights from iteration checkpoint: {iteration_model}")
         try:
-            model_args.checkpoint_path = model_checkpoint_path
-            model = MMEBModel.load(model_args, is_trainable=True)  # 修复：保持LoRA可训练
-            print_master(f"Successfully loaded model from iteration {resume_from_iteration}")
+            # 为迭代模型创建config.json（如果不存在）
+            config_path = os.path.join(iteration_model, "config.json")
+            if not os.path.exists(config_path):
+                print_master("🔧 Creating missing config.json for iteration model...")
+                # 从原始模型复制配置
+                import shutil
+                original_config = os.path.join(model_args.model_name, "config.json")
+                if os.path.exists(original_config):
+                    shutil.copy2(original_config, config_path)
+                    print_master("✅ Config.json created successfully")
+                else:
+                    print_master("⚠️  Original config.json not found, will use fallback method")
+            
+            model_args.checkpoint_path = iteration_model
+            model = MMEBModel.load(model_args, is_trainable=True)
+            print_master(f"✅ Successfully loaded model from iteration {resume_from_iteration}")
         except Exception as e:
-            print_master(f"Failed to load iteration checkpoint: {e}")
-            # Clear failed checkpoint path for fallback
+            print_master(f"❌ Failed to load iteration checkpoint: {e}")
+            print_master("🔄 Falling back to trainer checkpoint or new model")
+            if hasattr(model_args, 'checkpoint_path'):
+                delattr(model_args, 'checkpoint_path')
+            model = None
+            use_iteration_for_weights = False
+    
+    if model is None and use_trainer_for_state:
+        print_master(f"Loading model from trainer checkpoint: {trainer_checkpoint}")
+        try:
+            model_args.checkpoint_path = trainer_checkpoint
+            model = MMEBModel.load(model_args, is_trainable=True)
+            print_master("✅ Successfully loaded model from trainer checkpoint")
+        except Exception as e:
+            print_master(f"❌ Failed to load trainer checkpoint: {e}")
+            print_master("🔄 Will build new model")
             if hasattr(model_args, 'checkpoint_path'):
                 delattr(model_args, 'checkpoint_path')
             model = None
     
-    # Fallback to regular checkpoint if iteration checkpoint failed
-    if model is None and resume_checkpoint_dir:
-        print_master(f"Loading model from regular checkpoint: {resume_checkpoint_dir}")
-        try:
-            model_args.checkpoint_path = resume_checkpoint_dir
-            model = MMEBModel.load(model_args, is_trainable=True)  # 修复：保持LoRA可训练
-            print_master(f"Successfully loaded model from regular checkpoint")
-        except Exception as e:
-            print_master(f"Failed to load regular checkpoint: {e}")
-            # Clear failed checkpoint path for building new model
-            if hasattr(model_args, 'checkpoint_path'):
-                delattr(model_args, 'checkpoint_path')
-            model = None
-    
-    # Build new model if all checkpoint loading failed
     if model is None:
-        print_master("Building new model...")
+        print_master("🆕 Building new model from scratch...")
         model = MMEBModel.build(model_args)
+        print_master("✅ New model built successfully")
     
     # Load processor
     processor = load_processor(model_args, data_args)
@@ -306,11 +370,17 @@ def main():
                     print_master(f"Fast mode enabled: {config.get('fast_mode_max_steps', 5)} steps per iteration")
                 else:
                     # Use production mode settings
+                    # 🔧 Use new parameter name: steps_per_iteration instead of production_max_steps
+                    print_master(f"DEBUG: config keys = {list(config.keys())}")
+                    print_master(f"DEBUG: steps_per_iteration in config = {'steps_per_iteration' in config}")
+                    print_master(f"DEBUG: config.get('steps_per_iteration') = {config.get('steps_per_iteration')}")
+                    
+                    steps_per_iter = config.get('steps_per_iteration', config.get('production_max_steps', 1000))
                     iterative_params.update({
-                        'production_max_steps': config.get('production_max_steps', 1000),
+                        'steps_per_iteration': steps_per_iter,  # New parameter name
                         'production_save_steps': config.get('production_save_steps', 100)
                     })
-                    print_master(f"Production mode enabled: {config.get('production_max_steps', 1000)} steps per iteration")
+                    print_master(f"Production mode enabled: {steps_per_iter} steps per iteration")
                 
                 break
         
@@ -365,7 +435,9 @@ def main():
         )
         
         # Standard training
-        trainer.train(resume_from_checkpoint=resume_checkpoint_dir)
+        # Use trainer checkpoint if available and not using iteration model for weights
+        checkpoint_to_resume = trainer_checkpoint if (use_trainer_for_state and not use_iteration_for_weights) else None
+        trainer.train(resume_from_checkpoint=checkpoint_to_resume)
 
     # Save final model
     trainer.save_model(training_args.output_dir)

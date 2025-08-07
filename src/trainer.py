@@ -155,8 +155,34 @@ class MMEBTrainer(Trainer):
         return DataLoader(train_dataset, **dataloader_params)
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """
+        Load checkpoint with smart model loading logic for iterative training
+        """
+        print_master(f"Loading checkpoint from {resume_from_checkpoint}")
+        
+        # For iterative training, skip model reloading if the model was already loaded
+        # from iteration checkpoint in train_iterative.py
+        if (hasattr(self.args, 'max_iterations') and self.args.max_iterations > 0 and 
+            hasattr(self.model_args, 'checkpoint_path') and 
+            'iteration_' in str(self.model_args.checkpoint_path) or 'base_model' in str(self.model_args.checkpoint_path)):
+            print_master("🎯 Iterative training detected with iteration model already loaded")
+            print_master("   ➡️  Skipping model reload, using current model state")
+            print_master("   ➡️  Will only load training state (optimizer, scheduler, etc.)")
+            return
+            
+        # For standard training or when using trainer checkpoint
+        print_master("📁 Loading model from trainer checkpoint")
+        if not os.path.isdir(resume_from_checkpoint):
+            raise ValueError(f"Checkpoint directory {resume_from_checkpoint} does not exist")
+            
+        # Check if config.json exists in checkpoint
+        config_path = os.path.join(resume_from_checkpoint, "config.json")
+        if not os.path.exists(config_path):
+            print_master("⚠️  No config.json found in trainer checkpoint")
+            print_master("   ➡️  Will keep current model and only load training state")
+            return
+            
         self.model_args.checkpoint_path = resume_from_checkpoint
-        logger.info(f"Loading checkpoint from {resume_from_checkpoint}")
         self.model = MMEBModel.load(self.model_args)
         self.model_wrapped = self.model
 

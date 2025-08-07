@@ -177,6 +177,7 @@ if [ $NUM_GPUS -gt 1 ]; then
         --save_safetensors True \
         --remove_unused_columns False \
         --resume_from auto \
+        --resume_from_iteration auto \
         --max_len 512 \
         --resize_use_processor True \
         --resize_min_pixels 3136 \
@@ -225,6 +226,7 @@ else
         --save_safetensors True \
         --remove_unused_columns False \
         --resume_from auto \
+        --resume_from_iteration auto \
         --max_len 512 \
         --resize_use_processor True \
         --resize_min_pixels 3136 \
