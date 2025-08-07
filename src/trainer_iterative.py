@@ -7,6 +7,7 @@ import os
 import json
 import time
 import torch
+import torch.distributed as dist
 import logging
 from typing import Dict, List, Optional, Any
 from torch.utils.data import DataLoader
@@ -83,6 +84,9 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         # Save original dataset for reference
         self.original_dataset = self.train_dataset
         
+        # Configure logging for train.log generation
+        self._configure_logging()
+        
         # Try to resume from previous experiment
         self._try_resume_from_checkpoint()
         
@@ -90,6 +94,38 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         
         # Apply fast mode or production mode settings
         self._configure_training_mode()
+    
+    def _configure_logging(self):
+        """Configure additional logging to ensure train.log is generated"""
+        if hasattr(self.args, 'logging_dir') and self.args.logging_dir:
+            # Ensure the logging directory exists
+            import os
+            os.makedirs(self.args.logging_dir, exist_ok=True)
+            
+            # Add file handler to logger for train.log
+            log_file = os.path.join(self.args.logging_dir, "train.log")
+            
+            # Check if file handler already exists
+            root_logger = logging.getLogger()
+            file_handler_exists = any(
+                isinstance(handler, logging.FileHandler) and 
+                handler.baseFilename == os.path.abspath(log_file)
+                for handler in root_logger.handlers
+            )
+            
+            if not file_handler_exists:
+                file_handler = logging.FileHandler(log_file, mode='a')
+                file_handler.setLevel(logging.INFO)
+                formatter = logging.Formatter(
+                    '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s'
+                )
+                file_handler.setFormatter(formatter)
+                root_logger.addHandler(file_handler)
+                print_master(f"Added file logging to: {log_file}")
+            else:
+                print_master(f"File logging already configured for: {log_file}")
+        else:
+            print_master("Warning: logging_dir not set, train.log will not be generated")
     
     def _configure_training_mode(self):
         """Configure training parameters based on fast mode or production mode"""
@@ -128,29 +164,70 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         """Try to resume from a previous checkpoint to avoid recomputation"""
         output_dir = self.args.output_dir
         
-        # First, look for the latest iteration state (for complete metadata)
+        # First, look for the latest COMPLETE iteration state
+        latest_complete_iteration = None
         for i in range(self.max_iterations - 1, -1, -1):
             state_file = os.path.join(output_dir, f"iteration_{i}_state.json")
             if os.path.exists(state_file):
-                print_master(f"Found iteration state for iteration {i}, loading metadata...")
-                
-                # Load iteration state (metadata only)
-                with open(state_file, 'r') as f:
-                    state = json.load(f)
-                
-                self.current_iteration = i + 1  # Start from next iteration
-                self.iteration_metrics = state.get('iteration_metrics', {})
-                
-                # Load hard negatives if available
-                hard_neg_file = os.path.join(output_dir, f"hard_negatives_iter_{i}.json")
-                if os.path.exists(hard_neg_file):
-                    print_master(f"Loading hard negatives from iteration {i}")
-                    if hasattr(self.train_dataset, 'hard_negatives_file'):
-                        self.train_dataset.hard_negatives_file = hard_neg_file
-                        self.train_dataset._load_hard_negatives(i)  # Pass iteration number
-                
-                print_master(f"Resuming from iteration {self.current_iteration} (model loaded separately)")
-                return True
+                try:
+                    with open(state_file, 'r') as f:
+                        state = json.load(f)
+                    
+                    # Check if this iteration is complete
+                    if state.get('iteration_complete', False):
+                        latest_complete_iteration = i
+                        print_master(f"Found COMPLETE iteration {i}")
+                        break
+                    else:
+                        print_master(f"Found INCOMPLETE iteration {i}")
+                        # Continue checking for older complete iterations
+                except Exception as e:
+                    print_master(f"Error reading iteration state {i}: {e}")
+                    continue
+        
+        if latest_complete_iteration is not None:
+            # Load metadata from the latest complete iteration
+            state_file = os.path.join(output_dir, f"iteration_{latest_complete_iteration}_state.json")
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            self.current_iteration = latest_complete_iteration + 1  # Start from next iteration
+            self.iteration_metrics = state.get('iteration_metrics', {})
+            
+            # Load hard negatives if available and needed
+            if latest_complete_iteration < self.max_iterations - 1:
+                hard_neg_file = os.path.join(output_dir, f"hard_negatives_iter_{latest_complete_iteration}.json")
+                if os.path.exists(hard_neg_file) and hasattr(self.train_dataset, 'hard_negatives_file'):
+                    self.train_dataset.hard_negatives_file = hard_neg_file
+                    self.train_dataset._load_hard_negatives(latest_complete_iteration)
+            
+            print_master(f"✅ Resuming from COMPLETE iteration {latest_complete_iteration}")
+            print_master(f"   ➡️  Next iteration to run: {self.current_iteration}")
+            return True
+        
+        # If no complete iterations found, check for partial completion
+        # Look for incomplete iterations and determine where to resume
+        for i in range(self.max_iterations - 1, -1, -1):
+            state_file = os.path.join(output_dir, f"iteration_{i}_state.json")
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, 'r') as f:
+                        state = json.load(f)
+                    
+                    completed_steps = state.get('completed_steps', {})
+                    print_master(f"Found INCOMPLETE iteration {i} with steps: {list(completed_steps.keys())}")
+                    
+                    # Resume from this incomplete iteration
+                    self.current_iteration = i
+                    self.iteration_metrics = state.get('iteration_metrics', {})
+                    
+                    print_master(f"🔄 Resuming from INCOMPLETE iteration {i}")
+                    print_master(f"   ➡️  Will complete remaining steps in iteration {i}")
+                    return True
+                    
+                except Exception as e:
+                    print_master(f"Error reading incomplete iteration state {i}: {e}")
+                    continue
         
         # If no iteration state found, check for cached embeddings and base model
         # This handles cases where base training completed but iteration didn't start
@@ -236,67 +313,96 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             
             self.current_iteration = iteration
             
+            # Check completion status of all steps for this iteration
+            completed_steps = self._check_iteration_completion_status(iteration)
+            print_master(f"🔍 Iteration {iteration} completion status: {completed_steps}")
+            
             # Step 1: Train current model (or skip if already completed)
-            if iteration == 0:
-                if hasattr(self, '_base_training_completed') and self._base_training_completed:
-                    print_master("✅ Base model training already completed, skipping...")
-                    print_master(f"   📁 Using existing base model from: {os.path.join(self.args.output_dir, 'base_model')}")
-                else:
+            if not completed_steps['model_training']:
+                if iteration == 0:
                     print_master("Iteration 0: Training base retrieval model...")
                     self._train_base_model()
-            else:
-                print_master(f"Iteration {iteration}: Training with augmented data...")
-                self._train_current_iteration()
-            
-            # 添加同步屏障：确保所有GPU完成训练
-            import torch.distributed as dist
-            if dist.is_initialized():
-                dist.barrier()
-                if not (iteration == 0 and hasattr(self, '_base_training_completed') and self._base_training_completed):
+                else:
+                    print_master(f"Iteration {iteration}: Training with augmented data...")
+                    # 🔧 验证训练状态连续性
+                    if not self._verify_training_state_continuity():
+                        print_master("‼️ Training state verification failed - proceeding with caution")
+                    
+                    self._train_current_iteration()
+                
+                # 添加同步屏障：确保所有GPU完成训练
+                if dist.is_initialized():
+                    dist.barrier()
                     print_master(f"All GPUs completed training for iteration {iteration}")
+            else:
+                print_master("✅ Model training already completed, skipping...")
             
             # Step 2: Evaluate current model performance (or skip if cached)
-            # Add distributed barrier to ensure all GPUs complete training before evaluation
-            if dist.is_initialized():
-                dist.barrier()
-            
-            # Use the improved evaluation method that handles distributed internally
-            eval_results = self._evaluate_current_model()
-            
-            self.iteration_metrics[iteration] = eval_results
+            if not completed_steps['evaluation']:
+                # Add distributed barrier to ensure all GPUs complete training before evaluation
+                if dist.is_initialized():
+                    dist.barrier()
+                
+                # Use the improved evaluation method that handles distributed internally
+                eval_results = self._evaluate_current_model()
+                self.iteration_metrics[iteration] = eval_results
+            else:
+                print_master("✅ Model evaluation already completed, loading cached results...")
+                # Load cached evaluation results
+                eval_file = os.path.join(self.args.output_dir, f"eval_results_iter_{iteration}.json")
+                with open(eval_file, 'r') as f:
+                    eval_results = json.load(f)
+                self.iteration_metrics[iteration] = eval_results
             
             # Step 3: Collect hard negatives (if not last iteration)
             if iteration < self.max_iterations - 1:
-                print_master(f"🔍 Starting hard negative collection for iteration {iteration}...")
-                hard_neg_start_time = time.time()
-                
-                hard_negatives = self._collect_hard_negatives(iteration)
-                
-                hard_neg_time = time.time() - hard_neg_start_time
-                print_master(f"Hard negative collection completed in {int(hard_neg_time//60):02d}:{int(hard_neg_time%60):02d}")
-                
-                # 添加同步屏障：确保所有GPU完成硬负样本收集
-                if dist.is_initialized():
-                    dist.barrier()
-                    print_master(f"All GPUs completed hard negative collection for iteration {iteration}")
+                if not completed_steps['hard_negatives_collection']:
+                    print_master(f"🔍 Starting hard negative collection for iteration {iteration}...")
+                    hard_neg_start_time = time.time()
+                    
+                    hard_negatives = self._collect_hard_negatives(iteration)
+                    
+                    hard_neg_time = time.time() - hard_neg_start_time
+                    print_master(f"Hard negative collection completed in {int(hard_neg_time//60):02d}:{int(hard_neg_time%60):02d}")
+                    
+                    # 添加同步屏障：确保所有GPU完成硬负样本收集
+                    if dist.is_initialized():
+                        dist.barrier()
+                        print_master(f"All GPUs completed hard negative collection for iteration {iteration}")
+                else:
+                    print_master("✅ Hard negative collection already completed, loading cached results...")
+                    # Load cached hard negatives
+                    hard_neg_file = os.path.join(self.args.output_dir, f"hard_negatives_iter_{iteration}.json")
+                    with open(hard_neg_file, 'r') as f:
+                        hard_negatives = json.load(f)
+                    hard_neg_time = 0  # No time spent since cached
                 
                 # Step 4: Generate augmented captions using foundation model
                 if len(hard_negatives) > 0:
-                    print_master(f"📝 Starting caption generation for {len(hard_negatives)} hard negatives...")
-                    caption_start_time = time.time()
-                    
-                    augmented_samples = self._generate_augmented_captions(hard_negatives)
-                    
-                    caption_time = time.time() - caption_start_time
-                    print_master(f"Caption generation completed in {int(caption_time//60):02d}:{int(caption_time%60):02d}")
-                    
-                    # 添加同步屏障：确保所有GPU完成caption生成
-                    if dist.is_initialized():
-                        dist.barrier()
-                        print_master(f"All GPUs completed caption generation for iteration {iteration}")
-                    
-                    # Step 5: Prepare dataset for next iteration
-                    self._prepare_next_iteration_dataset(iteration + 1, augmented_samples)
+                    if not completed_steps['caption_generation']:
+                        print_master(f"📝 Starting caption generation for {len(hard_negatives)} hard negatives...")
+                        caption_start_time = time.time()
+                        
+                        augmented_samples = self._generate_augmented_captions(hard_negatives)
+                        
+                        caption_time = time.time() - caption_start_time
+                        print_master(f"Caption generation completed in {int(caption_time//60):02d}:{int(caption_time%60):02d}")
+                        
+                        # 添加同步屏障：确保所有GPU完成caption生成
+                        if dist.is_initialized():
+                            dist.barrier()
+                            print_master(f"All GPUs completed caption generation for iteration {iteration}")
+                        
+                        # Step 5: Prepare dataset for next iteration
+                        self._prepare_next_iteration_dataset(iteration + 1, augmented_samples)
+                    else:
+                        print_master("✅ Caption generation already completed, loading cached results...")
+                        # Load cached augmented samples
+                        augmented_file = os.path.join(self.args.output_dir, f"augmented_samples_iter_{iteration + 1}.json")
+                        with open(augmented_file, 'r') as f:
+                            saved_data = json.load(f)
+                        augmented_samples = saved_data.get('samples', [])
+                        caption_time = 0  # No time spent since cached
                     
                     # 性能统计
                     total_time = hard_neg_time + caption_time
@@ -314,7 +420,12 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     print_master("No hard negatives found, stopping early")
                     break
             
-            # Save iteration checkpoint
+            # 🔧 CRITICAL FIX: 同步屏障确保所有GPU完成当前迭代后再保存状态
+            if dist.is_initialized():
+                dist.barrier()
+                print_master(f"All GPUs completed iteration {iteration}, saving state...")
+            
+            # Save iteration checkpoint (只有rank 0写入)
             self._save_iteration_state(iteration)
         
         print_master("\nIterative training completed!")
@@ -326,13 +437,28 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         
         # Use original dataset
         self.train_dataset = self.original_dataset
+        self._update_train_dataloader()
         
-        # Standard training
-        train_result = self.train()
+        # 设置第0次迭代的目标步数
+        if self.fast_mode:
+            target_steps = self.fast_mode_max_steps
+        else:
+            target_steps = self.production_max_steps
+        
+        self.args.max_steps = target_steps
+        print_master(f"Base model target steps: {target_steps}")
+        print_master("Starting fresh training for base model")
+        
+        # Standard training - HuggingFace Trainer处理一切
+        # 对于base model，不需要resume_from_checkpoint，因为这是第一次训练
+        train_result = self.train(resume_from_checkpoint=None)
         
         # Save base model
         base_model_path = os.path.join(self.args.output_dir, "base_model")
         self.save_model(base_model_path)
+        
+        print_master(f"Base model training completed: 0 → {self.state.global_step} steps")
+        print_master(f"✅ Base model saved to: {base_model_path}")
         
         return train_result
     
@@ -340,8 +466,43 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         """Train model for current iteration with augmented data"""
         print_master(f"Training iteration {self.current_iteration} model...")
         
-        # The dataset should already be prepared with augmented samples
-        train_result = self.train()
+        # 确保训练器使用最新的数据集
+        self._update_train_dataloader()
+        
+        # 计算当前迭代的目标步数
+        # HuggingFace Trainer会自动从当前global_step继续到max_steps
+        current_global_step = getattr(self.state, 'global_step', 0)
+        
+        if self.fast_mode:
+            steps_per_iteration = self.fast_mode_max_steps
+        else:
+            steps_per_iteration = self.production_max_steps
+        
+        # 设置新的max_steps目标
+        new_max_steps = current_global_step + steps_per_iteration
+        old_max_steps = self.args.max_steps
+        self.args.max_steps = new_max_steps
+        
+        print_master(f"Current global step: {current_global_step}")
+        print_master(f"Target max_steps: {new_max_steps} (adding {steps_per_iteration} steps)")
+        
+        # ❗️ 关键修复：找到最新的检查点并从中恢复完整训练状态 ❗️
+        from transformers.trainer_utils import get_last_checkpoint
+        latest_checkpoint = get_last_checkpoint(self.args.output_dir)
+        
+        if latest_checkpoint is None and self.current_iteration > 0:
+            print_master("‼️ CRITICAL WARNING: No checkpoint found to resume from for iterative training!")
+            print_master("‼️ This will cause optimizer/scheduler state reset and performance degradation!")
+        elif latest_checkpoint:
+            print_master(f"🔄 Resuming from checkpoint: {latest_checkpoint}")
+            print_master("✅ This will preserve optimizer, scheduler, and global_step state")
+        else:
+            print_master("🆕 Starting fresh training (iteration 0)")
+        
+        # 显式地从最新检查点恢复，这将加载模型、优化器、调度器和训练状态
+        train_result = self.train(resume_from_checkpoint=latest_checkpoint)
+        
+        print_master(f"Training completed: {current_global_step} → {self.state.global_step} steps")
         
         # Save iteration model
         iter_model_path = os.path.join(self.args.output_dir, f"iteration_{self.current_iteration}")
@@ -349,9 +510,73 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         
         return train_result
     
+    def _update_train_dataloader(self):
+        """Update train dataloader to reflect dataset changes"""
+        if hasattr(self, '_train_dataloader'):
+            # Clear cached dataloader to force recreation with new dataset
+            del self._train_dataloader
+        
+        # Force recreation of dataloader with updated dataset
+        self.get_train_dataloader()
+        
+        # 获取数据集的详细信息用于更准确的日志记录
+        total_samples = len(self.train_dataset)
+        if hasattr(self.train_dataset, 'augmented_samples'):
+            augmented_count = len(self.train_dataset.augmented_samples)
+            original_count = total_samples - augmented_count
+            print_master(f"🔄 Updated train dataloader:")
+            print_master(f"  - Total samples: {total_samples}")
+            print_master(f"  - Original samples: {original_count}")
+            print_master(f"  - Augmented samples: {augmented_count}")
+        else:
+            print_master(f"🔄 Updated train dataloader with {total_samples} total samples")
+    
+    def _verify_training_state_continuity(self):
+        """Verify that training state is properly maintained across iterations"""
+        if not hasattr(self, 'state') or self.state is None:
+            print_master("⚠️ WARNING: Trainer state is None - this indicates a problem")
+            return False
+        
+        global_step = getattr(self.state, 'global_step', 0)
+        
+        # For iterations > 0, we should have some training progress
+        if self.current_iteration > 0 and global_step == 0:
+            print_master("‼️ CRITICAL: global_step is 0 in iteration > 0 - training state was reset!")
+            return False
+        
+        # Check if we have optimizer state
+        from transformers.trainer_utils import get_last_checkpoint
+        latest_checkpoint = get_last_checkpoint(self.args.output_dir)
+        if latest_checkpoint and self.current_iteration > 0:
+            import os
+            optimizer_file = os.path.join(latest_checkpoint, "optimizer.pt")
+            scheduler_file = os.path.join(latest_checkpoint, "scheduler.pt")
+            
+            if not os.path.exists(optimizer_file):
+                print_master("‼️ CRITICAL: optimizer.pt not found in latest checkpoint!")
+                return False
+            if not os.path.exists(scheduler_file):
+                print_master("‼️ CRITICAL: scheduler.pt not found in latest checkpoint!")
+                return False
+        
+        print_master(f"✅ Training state verification passed: global_step={global_step}")
+        return True
+    
     def _evaluate_current_model(self) -> Dict[str, float]:
-        """Evaluate current model on validation set with optimizations"""
+        """Evaluate current model on validation set with optimizations and caching"""
         print_master(f"Evaluating iteration {self.current_iteration} model...")
+        
+        # Check if evaluation results already exist for this iteration
+        eval_results_file = os.path.join(self.args.output_dir, f"eval_results_iter_{self.current_iteration}.json")
+        if os.path.exists(eval_results_file):
+            print_master(f"Found cached evaluation results for iteration {self.current_iteration}, loading...")
+            try:
+                with open(eval_results_file, 'r') as f:
+                    cached_results = json.load(f)
+                print_master(f"Loaded cached evaluation results: {cached_results}")
+                return cached_results
+            except Exception as e:
+                print_master(f"Error loading cached evaluation results: {e}, proceeding with fresh evaluation")
         
         try:
             # Initialize evaluator if not already done
@@ -372,7 +597,6 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 print_master(f"Real evaluator initialized successfully (batch_size={eval_batch_size})")
             
             # Check if distributed evaluation is available and beneficial
-            import torch.distributed as dist
             use_distributed = (dist.is_initialized() and 
                              dist.get_world_size() > 1 and 
                              hasattr(self.evaluator, '_evaluate_distributed'))
@@ -432,6 +656,16 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     'iteration': self.current_iteration
                 }
         
+        # Save evaluation results to cache for future use (只有主进程写入)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            eval_results_file = os.path.join(self.args.output_dir, f"eval_results_iter_{self.current_iteration}.json")
+            try:
+                with open(eval_results_file, 'w') as f:
+                    json.dump(eval_results, f, indent=2)
+                print_master(f"Saved evaluation results to {eval_results_file}")
+            except Exception as e:
+                print_master(f"Warning: Failed to save evaluation results: {e}")
+        
         print_master(f"Iteration {self.current_iteration} results: {eval_results}")
         return eval_results
     
@@ -460,7 +694,6 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 self.train_dataset.fast_mode_retrieval_db_size = self.fast_mode_retrieval_db_size
             
             # 使用分布式硬负样本收集
-            import torch.distributed as dist
             if dist.is_initialized() and dist.get_world_size() > 1:
                 print_master("Using distributed hard negative collection...")
                 hard_negatives = self.train_dataset.collect_hard_negatives_batch_distributed(
@@ -480,7 +713,6 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                         (f"(limited to {sample_limit})" if sample_limit else "(no limit)"))
             
             # Cache the results (only master process)
-            import torch.distributed as dist
             if not dist.is_initialized() or dist.get_rank() == 0:
                 os.makedirs(os.path.dirname(cache_file), exist_ok=True)
                 with open(cache_file, 'w') as f:
@@ -529,7 +761,6 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 self.train_dataset.foundation_model = self.foundation_model
             
             # 使用分布式caption生成
-            import torch.distributed as dist
             if dist.is_initialized() and dist.get_world_size() > 1:
                 print_master("Using distributed caption generation...")
                 augmented_samples = self.train_dataset.generate_augmented_captions_distributed(hard_negatives)
@@ -566,18 +797,43 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             "samples": augmented_samples
         }
         
-        with open(augmented_file, 'w') as f:
-            json.dump(augmented_data, f, indent=2)
-        print_master(f"Saved {len(augmented_samples)} augmented samples to {augmented_file}")
+        # Save augmented samples to file (只有主进程写入)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            with open(augmented_file, 'w') as f:
+                json.dump(augmented_data, f, indent=2)
+            print_master(f"Saved {len(augmented_samples)} augmented samples to {augmented_file}")
+        else:
+            print_rank(f"GPU {dist.get_rank()}: Skipping augmented samples save (only rank 0 writes)")
+        
+        # 同步屏障：确保所有GPU都能看到保存的文件
+        if dist.is_initialized():
+            dist.barrier()
+            print_master("All GPUs synchronized after augmented samples save")
         
         if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
+            # 记录数据集更新前的状态
+            old_dataset_len = len(self.train_dataset)
+            old_augmented_len = len(self.train_dataset.augmented_samples)
+            
             # Update dataset with augmented samples
             self.train_dataset.iteration_round = next_iteration
             self.train_dataset.augmented_samples.extend(augmented_samples)
+            
+            # 记录数据集更新后的状态
+            new_dataset_len = len(self.train_dataset)
+            new_augmented_len = len(self.train_dataset.augmented_samples)
+            
             # Update hard negatives file path for new iteration
             self.train_dataset.hard_negatives_file = os.path.join(
                 self.args.output_dir, f"hard_negatives_iter_{next_iteration}.json"
             )
+            
+            # 更准确的日志记录
+            print_master(f"📊 Dataset update summary:")
+            print_master(f"  - Added {len(augmented_samples)} new augmented samples")
+            print_master(f"  - Total augmented samples: {old_augmented_len} → {new_augmented_len}")
+            print_master(f"  - Total dataset size: {old_dataset_len} → {new_dataset_len}")
+            
         else:
             # Create new iterative dataset
             dataset_config = {
@@ -607,7 +863,9 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     **dataset_config
                 )
         
-        print_master(f"Dataset updated with {len(augmented_samples)} new samples")
+        # 重要：强制更新训练器的dataloader以反映数据集变化
+        self._update_train_dataloader()
+        print_master(f"Training dataloader updated for iteration {next_iteration}")
     
     def _compute_sample_statistics(self, samples: List[Dict]) -> Dict[str, Any]:
         """Compute statistics for augmented samples"""
@@ -700,7 +958,12 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         print_master(f"Dataset prepared for iteration {iteration} with {len(all_augmented_samples)} total augmented samples")
     
     def _save_iteration_state(self, iteration: int):
-        """Save iteration state and metrics"""
+        """Save iteration state and metrics with step completion tracking"""
+        # 🔧 CRITICAL FIX: 只有主进程（rank 0）写入状态文件，避免竞争条件
+        if dist.is_initialized() and dist.get_rank() != 0:
+            print_rank(f"GPU {dist.get_rank()}: Skipping state save (only rank 0 writes)")
+            return
+        
         state_file = os.path.join(self.args.output_dir, f"iteration_{iteration}_state.json")
         
         # Determine correct model path based on iteration
@@ -709,18 +972,67 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         else:
             model_path = os.path.join(self.args.output_dir, f"iteration_{iteration}")
         
+        # Check completion status of all iteration steps
+        completed_steps = self._check_iteration_completion_status(iteration)
+        
         state = {
             'iteration': iteration,
             'metrics': self.iteration_metrics,
             'model_path': model_path,
-            'hard_negatives_file': f"hard_negatives_iter_{iteration}.json"
+            'hard_negatives_file': f"hard_negatives_iter_{iteration}.json",
+            'completed_steps': completed_steps,
+            'iteration_complete': completed_steps.get('all_steps_complete', False),
+            'timestamp': time.time()
         }
         
-        with open(state_file, 'w') as f:
-            json.dump(state, f, indent=2)
+        try:
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            completion_status = "✅ COMPLETE" if state['iteration_complete'] else "🔄 IN PROGRESS"
+            print_master(f"Saved iteration {iteration} state to {state_file} - {completion_status}")
+            print_master(f"Model path recorded as: {model_path}")
+            print_master(f"Completed steps: {list(completed_steps.keys())}")
+        except Exception as e:
+            print_master(f"❌ Error saving iteration state: {e}")
+    
+    def _check_iteration_completion_status(self, iteration: int) -> dict:
+        """Check which steps of an iteration have been completed"""
+        output_dir = self.args.output_dir
+        completed_steps = {}
         
-        print_master(f"Saved iteration {iteration} state to {state_file}")
-        print_master(f"Model path recorded as: {model_path}")
+        # Step 1: Model training completed
+        if iteration == 0:
+            model_path = os.path.join(output_dir, "base_model")
+        else:
+            model_path = os.path.join(output_dir, f"iteration_{iteration}")
+        
+        completed_steps['model_training'] = os.path.exists(model_path)
+        
+        # Step 2: Evaluation completed
+        eval_file = os.path.join(output_dir, f"eval_results_iter_{iteration}.json")
+        completed_steps['evaluation'] = os.path.exists(eval_file)
+        
+        # Step 3: Hard negatives collected (only for non-final iterations)
+        is_final_iteration = iteration >= (self.max_iterations - 1)
+        if is_final_iteration:
+            completed_steps['hard_negatives_collection'] = True  # Not needed for final iteration
+        else:
+            hard_neg_file = os.path.join(output_dir, f"hard_negatives_iter_{iteration}.json")
+            completed_steps['hard_negatives_collection'] = os.path.exists(hard_neg_file)
+        
+        # Step 4: Caption generation completed (only for non-final iterations)
+        if is_final_iteration:
+            completed_steps['caption_generation'] = True  # Not needed for final iteration
+        else:
+            next_iteration = iteration + 1
+            augmented_file = os.path.join(output_dir, f"augmented_samples_iter_{next_iteration}.json")
+            completed_steps['caption_generation'] = os.path.exists(augmented_file)
+        
+        # Check if all required steps are complete
+        completed_steps['all_steps_complete'] = all(completed_steps.values())
+        
+        return completed_steps
     
     def _load_iteration_state(self, iteration: int):
         """Load iteration state for resuming (model already loaded externally)"""
@@ -756,20 +1068,21 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             print_master(f"\nBest performance: Iteration {best_iteration}")
             print_master(f"Best metrics: {best_metrics}")
         
-        # Save summary
-        summary_file = os.path.join(self.args.output_dir, "training_summary.json")
-        summary = {
-            'max_iterations': self.max_iterations,
-            'completed_iterations': len(self.iteration_metrics),
-            'iteration_metrics': self.iteration_metrics,
-            'best_iteration': best_iteration if self.iteration_metrics else None,
-            'best_metrics': best_metrics if self.iteration_metrics else None
-        }
-        
-        with open(summary_file, 'w') as f:
-            json.dump(summary, f, indent=2)
-        
-        print_master(f"Training summary saved to {summary_file}")
+        # Save summary (只有主进程写入)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            summary_file = os.path.join(self.args.output_dir, "training_summary.json")
+            summary = {
+                'max_iterations': self.max_iterations,
+                'completed_iterations': len(self.iteration_metrics),
+                'iteration_metrics': self.iteration_metrics,
+                'best_iteration': best_iteration if self.iteration_metrics else None,
+                'best_metrics': best_metrics if self.iteration_metrics else None
+            }
+            
+            with open(summary_file, 'w') as f:
+                json.dump(summary, f, indent=2)
+            
+            print_master(f"Training summary saved to {summary_file}")
 
 
 def create_iterative_trainer(

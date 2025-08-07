@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 import torch
 import wandb
 import yaml
+import json
 from transformers import HfArgumentParser
 from src.arguments import ModelArguments, DataArguments, TrainingArguments
 from src.data.collator.train_collator import MultimodalDataCollator
@@ -86,6 +87,9 @@ def main():
             sys.argv.append('--local_rank')
             sys.argv.append(rank)
     
+    # Disable tokenizer parallelism warnings
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     
@@ -116,6 +120,14 @@ def main():
     else:
         logger.info("No checkpoint found. Starting fresh training.")
 
+    # Set up logging_dir for train.log generation if not specified
+    if not training_args.logging_dir:
+        training_args.logging_dir = os.path.join(training_args.output_dir, "logs")
+        print_master(f"Setting logging_dir to: {training_args.logging_dir}")
+    
+    # Ensure logging directory exists
+    os.makedirs(training_args.logging_dir, exist_ok=True)
+
     # Initialize WandB if enabled
     if 'wandb' in training_args.report_to:
         if (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or (not torch.distributed.is_initialized()):
@@ -132,56 +144,113 @@ def main():
     # Load retrieval model with checkpoint resume support
     print_master("Loading retrieval model...")
     
+    # 修复：按照VLM2Vec方式，先从原始模型获取正确的model_backbone
+    from transformers import AutoConfig
+    hf_config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+    if not getattr(model_args, "model_backbone", None):
+        model_backbone = get_backbone_name(hf_config=hf_config, model_type=getattr(model_args, 'model_type', None))
+        setattr(model_args, 'model_backbone', model_backbone)
+        setattr(training_args, 'model_backbone', model_backbone)
+    print_master(f'Model backbone: {model_args.model_backbone}')
+    
     # Check for iterative training checkpoints
     resume_from_iteration = None
+    model_checkpoint_path = None
+    
+    def check_iteration_complete(output_dir, iteration, max_iterations):
+        """Check if an iteration is completely finished"""
+        state_file = os.path.join(output_dir, f"iteration_{iteration}_state.json")
+        if not os.path.exists(state_file):
+            return False
+        
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            return state.get('iteration_complete', False)
+        except:
+            return False
+    
     if training_args.resume_from == 'auto':
-        # Auto-detect latest iteration checkpoint
-        for i in range(10, -1, -1):  # Check last 10 iterations
-            iter_checkpoint = os.path.join(training_args.output_dir, f"iteration_{i}")
-            if os.path.exists(iter_checkpoint):
+        # Auto-detect latest COMPLETE iteration checkpoint
+        # First check for complete iterations (highest to lowest)
+        for i in range(10, -1, -1):  # Check iterations 0-10
+            if i == 0:
+                # Special case for iteration 0 -> base_model
+                model_path = os.path.join(training_args.output_dir, "base_model")
+            else:
+                model_path = os.path.join(training_args.output_dir, f"iteration_{i}")
+            
+            if os.path.exists(model_path) and check_iteration_complete(training_args.output_dir, i, 10):
                 resume_from_iteration = i
-                print_master(f"Found iteration checkpoint: iteration_{i}")
+                model_checkpoint_path = model_path
+                print_master(f"Found COMPLETE iteration {i} checkpoint: {model_path}")
                 break
+        
+        # If no complete iterations found, look for incomplete iterations
+        if resume_from_iteration is None:
+            for i in range(10, -1, -1):
+                if i == 0:
+                    model_path = os.path.join(training_args.output_dir, "base_model")
+                else:
+                    model_path = os.path.join(training_args.output_dir, f"iteration_{i}")
+                
+                if os.path.exists(model_path):
+                    resume_from_iteration = i
+                    model_checkpoint_path = model_path
+                    print_master(f"Found INCOMPLETE iteration {i} checkpoint: {model_path}")
+                    break
+                
     elif training_args.resume_from.startswith('iter_'):
         # Manual iteration specification: iter_2
         iter_num = training_args.resume_from.split('_')[1]
         if iter_num.isdigit():
-            iter_checkpoint = os.path.join(training_args.output_dir, f"iteration_{iter_num}")
+            iter_num = int(iter_num)
+            if iter_num == 0:
+                # Special case for iteration 0 -> base_model
+                iter_checkpoint = os.path.join(training_args.output_dir, "base_model")
+            else:
+                iter_checkpoint = os.path.join(training_args.output_dir, f"iteration_{iter_num}")
+            
             if os.path.exists(iter_checkpoint):
-                resume_from_iteration = int(iter_num)
-                print_master(f"Manually resuming from iteration_{iter_num}")
+                resume_from_iteration = iter_num
+                model_checkpoint_path = iter_checkpoint
+                complete_status = "COMPLETE" if check_iteration_complete(training_args.output_dir, iter_num, 10) else "INCOMPLETE"
+                print_master(f"Manually resuming from {complete_status} iteration {iter_num} at {iter_checkpoint}")
     
-    # Load model based on checkpoint availability
-    if resume_from_iteration is not None:
-        # Load from iteration checkpoint
-        iter_checkpoint_path = os.path.join(training_args.output_dir, f"iteration_{resume_from_iteration}")
-        print_master(f"Loading model from iteration checkpoint: {iter_checkpoint_path}")
-        
+    # Unified model loading logic - load model only once
+    model = None
+    if model_checkpoint_path is not None:
+        # Try to load from iteration/base checkpoint first
+        print_master(f"Loading model from iteration checkpoint: {model_checkpoint_path}")
         try:
-            model = MMEBModel.load(iter_checkpoint_path, model_args)
+            model_args.checkpoint_path = model_checkpoint_path
+            model = MMEBModel.load(model_args, is_trainable=True)  # 修复：保持LoRA可训练
             print_master(f"Successfully loaded model from iteration {resume_from_iteration}")
         except Exception as e:
             print_master(f"Failed to load iteration checkpoint: {e}")
-            print_master("Falling back to base model...")
-            model = MMEBModel.build(model_args)
-            resume_from_iteration = None
-    else:
-        # Build new model or load from regular checkpoint
-        if resume_checkpoint_dir:
-            try:
-                print_master(f"Loading model from checkpoint: {resume_checkpoint_dir}")
-                model = MMEBModel.load(resume_checkpoint_dir, model_args)
-            except Exception as e:
-                print_master(f"Failed to load checkpoint: {e}")
-                print_master("Building new model...")
-                model = MMEBModel.build(model_args)
-        else:
-            model = MMEBModel.build(model_args)
+            # Clear failed checkpoint path for fallback
+            if hasattr(model_args, 'checkpoint_path'):
+                delattr(model_args, 'checkpoint_path')
+            model = None
     
-    model_backbone = get_backbone_name(hf_config=model.config)
-    setattr(model_args, 'model_backbone', model_backbone)
-    setattr(training_args, 'model_backbone', model_backbone)
-    print_rank(f'Model backbone: {model_backbone}')
+    # Fallback to regular checkpoint if iteration checkpoint failed
+    if model is None and resume_checkpoint_dir:
+        print_master(f"Loading model from regular checkpoint: {resume_checkpoint_dir}")
+        try:
+            model_args.checkpoint_path = resume_checkpoint_dir
+            model = MMEBModel.load(model_args, is_trainable=True)  # 修复：保持LoRA可训练
+            print_master(f"Successfully loaded model from regular checkpoint")
+        except Exception as e:
+            print_master(f"Failed to load regular checkpoint: {e}")
+            # Clear failed checkpoint path for building new model
+            if hasattr(model_args, 'checkpoint_path'):
+                delattr(model_args, 'checkpoint_path')
+            model = None
+    
+    # Build new model if all checkpoint loading failed
+    if model is None:
+        print_master("Building new model...")
+        model = MMEBModel.build(model_args)
     
     # Load processor
     processor = load_processor(model_args, data_args)
@@ -265,8 +334,18 @@ def main():
         
         # Start iterative training with proper resume handling
         if resume_from_iteration is not None:
-            print_master(f"Resuming iterative training from iteration {resume_from_iteration + 1}")
-            trainer.iterative_train(resume_from_iteration=resume_from_iteration + 1)
+            # Check if the found iteration is complete
+            is_iteration_complete = check_iteration_complete(training_args.output_dir, resume_from_iteration, 10)
+            
+            if is_iteration_complete:
+                # Complete iteration found - start from next iteration
+                next_iteration = resume_from_iteration + 1
+                print_master(f"Loaded COMPLETE iteration {resume_from_iteration}, starting from iteration {next_iteration}")
+                trainer.iterative_train(resume_from_iteration=next_iteration)
+            else:
+                # Incomplete iteration found - resume from same iteration
+                print_master(f"Loaded INCOMPLETE iteration {resume_from_iteration}, resuming from iteration {resume_from_iteration}")
+                trainer.iterative_train(resume_from_iteration=resume_from_iteration)
         else:
             print_master("Starting iterative training from scratch")
             trainer.iterative_train(resume_from_iteration=0)

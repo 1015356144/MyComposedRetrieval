@@ -172,6 +172,7 @@ if [ $NUM_GPUS -gt 1 ]; then
         --warmup_steps 882 \
         --save_steps 3000 \
         --logging_steps 50 \
+        --logging_dir $EXP_DIR/logs \
         --eval_steps 1000 \
         --save_safetensors True \
         --remove_unused_columns False \
@@ -191,7 +192,7 @@ if [ $NUM_GPUS -gt 1 ]; then
         --adam_beta2 0.999 \
         --max_grad_norm 1.0 \
         --report_to wandb \
-        2>&1 | tee $EXP_DIR/train.log"
+        2>&1 | tee $EXP_DIR/training_output.log"
 else
     echo "==> Using single GPU for training"
     cmd="CUDA_VISIBLE_DEVICES=0 python \
@@ -219,6 +220,7 @@ else
         --warmup_steps 882 \
         --save_steps 500 \
         --logging_steps 50 \
+        --logging_dir $EXP_DIR/logs \
         --eval_steps 1000 \
         --save_safetensors True \
         --remove_unused_columns False \
@@ -238,7 +240,7 @@ else
         --adam_beta2 0.999 \
         --max_grad_norm 1.0 \
         --report_to wandb \
-        2>&1 | tee $EXP_DIR/train.log"
+        2>&1 | tee $EXP_DIR/training_output.log"
 fi
 
 echo "==> Running command:"
