@@ -311,85 +311,93 @@ class IterativeCIRRDataset(Dataset):
 
     def collect_hard_negatives_batch_distributed(self, retrieval_model, batch_size: int = 8, max_samples: int = None):
         """
-        多卡并行的硬负样本收集
+        (最终合并重构版) 分布式硬负样本收集。
         
-        Args:
-            retrieval_model: 检索模型
-            batch_size: 批次大小
-            max_samples: 最大样本数（用于fast mode）
+        该版本将特征计算和硬负样本挖掘的逻辑整合在一起，遵循以下稳健且高效的流程：
+        1.  Rank 0 负责计算或加载完整的候选图片特征集 (target_embeddings)。
+        2.  Rank 0 将特征保存到共享缓存文件。
+        3.  使用 dist.barrier() 确保所有进程等待 Rank 0 完成。
+        4.  所有进程从共享缓存文件加载完整的特征集到各自的显存中。
+        5.  每个进程独立、并行地处理分配给自己的查询任务。
+        6.  使用高效的 dist.all_gather_object 收集所有进程的硬负样本结果。
+        7.  Rank 0 汇总结果并保存最终文件。
         """
         import torch.distributed as dist
+        import time
+
+        # 检查是否为分布式环境
+        if not dist.is_initialized():
+            return self.collect_hard_negatives_batch(retrieval_model, batch_size, max_samples)
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         
-        print_rank(f"Starting distributed hard negative collection for iteration {self.iteration_round}")
-        
-        # 检查是否已有缓存
+        print_rank(f"GPU {rank}: Starting optimized hard negative collection (Iteration {self.iteration_round})")
+
+        # 检查是否已有最终缓存文件
         if os.path.exists(self.hard_negatives_file):
-            if dist.is_initialized() and dist.get_rank() == 0:
-                print_rank(f"Loading existing hard negatives from {self.hard_negatives_file}")
+            print_rank(f"GPU {rank}: Loading existing hard negatives from {self.hard_negatives_file}")
+            try:
                 with open(self.hard_negatives_file, 'r') as f:
                     hard_negatives = json.load(f)
                 
                 # 应用max_samples限制
                 if max_samples is not None and len(hard_negatives) > max_samples:
                     hard_negatives = hard_negatives[:max_samples]
-            else:
-                hard_negatives = []
-            
-            # 所有GPU从文件读取，避免broadcast
-            if dist.is_initialized() and dist.get_rank() != 0:
-                # 非rank 0 GPU等待文件存在，然后直接读取
-                wait_start = time.time()
-                while time.time() - wait_start < 30:  # 30秒等待
-                    if os.path.exists(self.hard_negatives_file):
-                        try:
-                            with open(self.hard_negatives_file, 'r') as f:
-                                hard_negatives = json.load(f)
-                            break
-                        except Exception as e:
-                            print_rank(f"GPU {dist.get_rank()}: Error reading hard negatives file: {e}")
-                    time.sleep(1)
-                else:
-                    print_rank(f"GPU {dist.get_rank()}: Timeout waiting for hard negatives file")
-                    hard_negatives = []
-            
-            self.hard_negatives_cache = hard_negatives
-            print_rank(f"Loaded {len(hard_negatives)} existing hard negatives")
-            return hard_negatives
+                
+                self.hard_negatives_cache = hard_negatives
+                print_rank(f"GPU {rank}: Loaded {len(hard_negatives)} existing hard negatives")
+                return hard_negatives
+            except Exception as e:
+                print_rank(f"GPU {rank}: Error loading existing hard negatives: {e}, will recompute")
+
+        # ====================================================================================
+        # 步骤 1-3: 准备共享数据 (Target Embeddings)，采用 "Rank 0 计算，全体加载" 模式
+        # ====================================================================================
         
-        if not dist.is_initialized():
-            # 单卡模式，使用原有逻辑
-            return self.collect_hard_negatives_batch(retrieval_model, batch_size, max_samples)
+        target_embeddings_cache_file = self._get_cache_file_path(self.retrieval_candidates)
+
+        if rank == 0:
+            print_rank("GPU 0 is preparing shared target embeddings...")
+            # 调用单卡的 _get_or_compute_target_embeddings 函数，它内部会处理缓存和计算
+            self._get_or_compute_target_embeddings(
+                self.retrieval_candidates, 
+                retrieval_model,
+                getattr(retrieval_model, 'processor', None),
+                getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
+                'cuda:0'  # 明确在 rank 0 的设备上
+            )
+
+        # 全体在此等待，确保 rank 0 已将最新的 embeddings 文件写入磁盘
+        print_rank(f"GPU {rank}: Waiting at barrier for target embeddings to be ready...")
+        dist.barrier()
+        print_rank(f"GPU {rank}: Barrier passed. Loading shared embeddings...")
+
+        # 所有进程从共享文件加载到各自的 GPU
+        try:
+            cached_data = torch.load(target_embeddings_cache_file, map_location=device, weights_only=True)
+            target_embeddings = cached_data['embeddings'].to(next(retrieval_model.parameters()).dtype)
+            print_rank(f"GPU {rank}: ✅ Successfully loaded {target_embeddings.shape[0]} shared target embeddings.")
+        except Exception as e:
+            raise RuntimeError(f"GPU {rank}: CRITICAL ERROR - Failed to load shared embeddings file '{target_embeddings_cache_file}': {e}")
+            
+        # ====================================================================================
+        # 步骤 4: 并行处理查询任务
+        # ====================================================================================
         
-        # 多卡模式
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
+        sample_annotations = self.annotations[:max_samples] if max_samples is not None else self.annotations
+        total_samples = len(sample_annotations)
+        samples_per_gpu = (total_samples + world_size - 1) // world_size
+        start_idx = rank * samples_per_gpu
+        end_idx = min(start_idx + samples_per_gpu, total_samples)
+        local_annotations = sample_annotations[start_idx:end_idx]
+
+        print_rank(f"GPU {rank}: Processing {len(local_annotations)} queries ({start_idx}-{end_idx})...")
         
         retrieval_model.eval()
-        
-        # 1. 确定样本范围
-        if max_samples is not None:
-            sample_limit = min(max_samples, len(self.annotations))
-            print_rank(f"Using max_samples limit: {sample_limit}")
-        else:
-            sample_limit = len(self.annotations)
-            print_rank(f"Processing all {sample_limit} samples")
-        
-        sample_annotations = self.annotations[:sample_limit]
-        
-        # 2. 分配任务到各个GPU
-        total_samples = len(sample_annotations)
-        per_gpu_samples = (total_samples + world_size - 1) // world_size
-        start_idx = rank * per_gpu_samples
-        end_idx = min(start_idx + per_gpu_samples, total_samples)
-        local_annotations = sample_annotations[start_idx:end_idx]
-        
-        print_rank(f"GPU {rank}: Processing samples {start_idx}-{end_idx} ({len(local_annotations)} samples)")
-        
-        # 3. 每个GPU独立加载完整的候选池embeddings
-        target_embeddings = self._get_or_compute_target_embeddings_distributed(retrieval_model)
-        
-        # 4. 处理本GPU的查询
         local_hard_negatives = []
+        
         if local_annotations:
             with torch.no_grad():
                 for i in range(0, len(local_annotations), batch_size):
@@ -397,7 +405,6 @@ class IterativeCIRRDataset(Dataset):
                     batch_num = i//batch_size + 1
                     total_batches = (len(local_annotations) + batch_size - 1)//batch_size
                     
-                    # 所有GPU都打印批次进度以便调试
                     print_rank(f"GPU {rank}: 🔍 Processing hard negative batch {batch_num}/{total_batches}")
                     
                     # 转换为检索格式
@@ -425,207 +432,54 @@ class IterativeCIRRDataset(Dataset):
                         
                     except Exception as e:
                         print_rank(f"GPU {rank}: ❌ Error in batch {batch_num}: {e}")
-                        print_rank(f"GPU {rank}: Traceback: {traceback.format_exc()}")
                         print_rank(f"GPU {rank}: Skipping batch {batch_num} and continuing...")
                         continue
         else:
             print_rank(f"GPU {rank}: No local annotations to process")
+
+        # ====================================================================================
+        # 步骤 5-6: 高效收集结果并返回
+        # ====================================================================================
+
+        print_rank(f"GPU {rank}: Finished local processing with {len(local_hard_negatives)} hard negatives. Gathering results...")
         
-        print_rank(f"GPU {rank}: Collected {len(local_hard_negatives)} local hard negatives")
-        
-        # 5. 文件式收集硬负样本，避免NCCL barrier超时
-        temp_hn_dir = os.path.join(self.experiment_dir, "temp_hard_negatives")
-        if rank == 0:
-            os.makedirs(temp_hn_dir, exist_ok=True)
-        
-        # 文件轮询等待目录创建
-        wait_count = 0
-        max_wait_dir = 60
-        while not os.path.exists(temp_hn_dir) and wait_count < max_wait_dir:
-            time.sleep(1)
-            wait_count += 1
-            if wait_count % 10 == 0:
-                print_rank(f"GPU {rank}: Waiting for hard negatives directory... ({wait_count}s)")
-        
-        if not os.path.exists(temp_hn_dir):
-            print_rank(f"GPU {rank}: Creating hard negatives directory locally...")
-            os.makedirs(temp_hn_dir, exist_ok=True)
-        
-        print_rank(f"GPU {rank}: Hard negatives directory confirmed: {temp_hn_dir}")
-        
-        # 每个GPU保存自己的硬负样本
-        local_hn_file = os.path.join(temp_hn_dir, f"gpu_{rank}_hard_negatives.json")
+        gathered_results = [None] * world_size
         try:
-            with open(local_hn_file, 'w') as f:
-                json.dump({
-                    'rank': rank,
-                    'hard_negatives': local_hard_negatives,
-                    'count': len(local_hard_negatives)
-                }, f, indent=2)
-            print_rank(f"GPU {rank}: ✅ Saved {len(local_hard_negatives)} hard negatives to {local_hn_file}")
+            # 使用原生通信收集结果（PyTorch 2.6.0 不支持 timeout 参数，使用默认超时）
+            dist.all_gather_object(gathered_results, local_hard_negatives)
+            print_rank(f"GPU {rank}: ✅ Successfully gathered results from all GPUs")
         except Exception as e:
-            print_rank(f"GPU {rank}: ❌ Error saving hard negatives: {e}")
-            # 尝试再次创建目录和文件
-            try:
-                os.makedirs(temp_hn_dir, exist_ok=True)
-                with open(local_hn_file, 'w') as f:
-                    json.dump({
-                        'rank': rank,
-                        'hard_negatives': local_hard_negatives,
-                        'count': len(local_hard_negatives)
-                    }, f, indent=2)
-                print_rank(f"GPU {rank}: ✅ Successfully saved hard negatives after retry")
-            except Exception as e2:
-                print_rank(f"GPU {rank}: ❌ Failed to save hard negatives after retry: {e2}")
-                # 创建空文件作为完成标记
-                try:
-                    with open(local_hn_file, 'w') as f:
-                        json.dump({
-                            'rank': rank,
-                            'hard_negatives': [],
-                            'count': 0,
-                            'error': str(e2)
-                        }, f, indent=2)
-                    print_rank(f"GPU {rank}: Created empty hard negatives file as fallback")
-                except:
-                    print_rank(f"GPU {rank}: ❌ Complete failure to save hard negatives file")
-        
-        # 文件式等待所有GPU完成写入，避免NCCL barrier超时
-        print_rank(f"GPU {rank}: Waiting for all GPUs to save hard negatives...")
-        max_hn_wait = 600  # 增加到10分钟等待时间，因为某些GPU可能处理时间较长
-        hn_wait_start = time.time()
-        
-        while time.time() - hn_wait_start < max_hn_wait:
-            all_files_exist = True
-            missing_files = []
-            for check_rank in range(world_size):
-                check_file = os.path.join(temp_hn_dir, f"gpu_{check_rank}_hard_negatives.json")
-                if not os.path.exists(check_file):
-                    all_files_exist = False
-                    missing_files.append(check_rank)
-            
-            if all_files_exist:
-                print_rank(f"GPU {rank}: ✅ All hard negatives files ready")
-                break
-            
-            # 每30秒报告一次状态，显示哪些GPU还没完成
-            elapsed = time.time() - hn_wait_start
-            if int(elapsed) % 30 == 0 and int(elapsed) > 0:
-                print_rank(f"GPU {rank}: Still waiting for hard negatives files... Missing GPUs: {missing_files} (elapsed: {int(elapsed)}s)")
-                
-                # 在120秒后提供更多调试信息
-                if elapsed > 120:
-                    print_rank(f"GPU {rank}: Debug - Checking individual GPU status:")
-                    for check_rank in range(world_size):
-                        check_file = os.path.join(temp_hn_dir, f"gpu_{check_rank}_hard_negatives.json")
-                        exists = os.path.exists(check_file)
-                        try:
-                            size = os.path.getsize(check_file) if exists else 0
-                            print_rank(f"GPU {rank}: - GPU {check_rank}: exists={exists}, size={size} bytes")
-                        except:
-                            print_rank(f"GPU {rank}: - GPU {check_rank}: exists={exists}, size=unknown")
-            
-            time.sleep(2)
-        else:
-            print_rank(f"GPU {rank}: ❌ Timeout waiting for all GPU hard negatives files after {max_hn_wait}s")
-            # 列出可用的文件
-            available_files = []
-            for check_rank in range(world_size):
-                check_file = os.path.join(temp_hn_dir, f"gpu_{check_rank}_hard_negatives.json")
-                if os.path.exists(check_file):
-                    available_files.append(check_rank)
-            print_rank(f"GPU {rank}: Available hard negatives files from GPUs: {available_files}")
-        
-        # 给文件系统额外时间确保所有写入完成
-        time.sleep(1)
-        
-        # 7. 主进程从文件收集和合并
+            print_rank(f"GPU {rank}: ⚠️ dist.all_gather_object failed: {e}. One or more GPUs may have failed.")
+            # 即使失败，也创建一个空列表，让主进程可以继续，避免程序崩溃
+            gathered_results = [[] for _ in range(world_size)]
+            gathered_results[rank] = local_hard_negatives  # 至少保证当前GPU的结果
+
+        final_hard_negatives = []
         if rank == 0:
-            merged_hard_negatives = local_hard_negatives.copy()  # 先添加自己的
-            
-            # 从其他GPU文件读取，带重试机制
-            for source_rank in range(1, world_size):
-                source_hn_file = os.path.join(temp_hn_dir, f"gpu_{source_rank}_hard_negatives.json")
-                
-                # 重试机制：最多尝试3次
-                for attempt in range(3):
-                    try:
-                        if os.path.exists(source_hn_file):
-                            with open(source_hn_file, 'r') as f:
-                                gpu_data = json.load(f)
-                            gpu_hard_negatives = gpu_data.get('hard_negatives', [])
-                            merged_hard_negatives.extend(gpu_hard_negatives)
-                            print_rank(f"Merged {len(gpu_hard_negatives)} hard negatives from GPU {source_rank}")
-                            break  # 成功读取，跳出重试循环
-                        else:
-                            if attempt == 2:  # 最后一次尝试
-                                print_rank(f"Warning: No hard negatives file found for GPU {source_rank} after 3 attempts")
-                            else:
-                                time.sleep(1)  # 等待1秒后重试
-                    except Exception as e:
-                        if attempt == 2:  # 最后一次尝试
-                            print_rank(f"Error reading hard negatives from GPU {source_rank}: {e}")
-                        else:
-                            time.sleep(1)  # 等待1秒后重试
-            
-            # 保存到最终文件
-            with open(self.hard_negatives_file, 'w') as f:
-                json.dump(merged_hard_negatives, f, indent=2)
-            
-            # 清理临时文件
-            try:
-                import shutil
-                shutil.rmtree(temp_hn_dir)
-                print_rank(f"Cleaned up temporary hard negatives directory")
-            except Exception as e:
-                print_rank(f"Warning: Could not clean up temp directory: {e}")
-                
-            print_rank(f"✅ Saved {len(merged_hard_negatives)} total hard negatives from {world_size} GPUs")
-            
-            print_rank(f"✅ Saved {len(merged_hard_negatives)} total hard negatives from {world_size} GPUs to {self.hard_negatives_file}")
-            self.hard_negatives_cache = merged_hard_negatives
-        else:
-            merged_hard_negatives = []
-        
-        # 8. 文件轮询等待rank 0完成文件写入，避免NCCL barrier超时
-        print_rank(f"GPU {rank}: Waiting for final hard negatives file...")
-        
-        final_hn_wait_start = time.time()
-        max_final_hn_wait = 120  # 2分钟等待时间
-        
-        while time.time() - final_hn_wait_start < max_final_hn_wait:
-            if os.path.exists(self.hard_negatives_file):
-                print_rank(f"GPU {rank}: ✅ Final hard negatives file ready")
-                break
-            
-            # 每10秒报告一次状态
-            elapsed = time.time() - final_hn_wait_start
-            if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-                print_rank(f"GPU {rank}: Still waiting for final hard negatives file... (elapsed: {int(elapsed)}s)")
-            
-            time.sleep(1)
-        else:
-            print_rank(f"GPU {rank}: ❌ Timeout waiting for final hard negatives file")
-        
-        # 所有GPU从文件读取最终结果，避免NCCL广播
-        if rank != 0:
-            try:
-                if os.path.exists(self.hard_negatives_file):
-                    with open(self.hard_negatives_file, 'r') as f:
-                        merged_hard_negatives = json.load(f)  # 使用统一的变量名
-                    self.hard_negatives_cache = merged_hard_negatives
-                    print_rank(f"GPU {rank}: Loaded {len(merged_hard_negatives)} hard negatives from file")
+            for gpu_idx, gpu_result in enumerate(gathered_results):
+                if gpu_result is not None:
+                    final_hard_negatives.extend(gpu_result)
+                    print_rank(f"Merged {len(gpu_result)} hard negatives from GPU {gpu_idx}")
                 else:
-                    merged_hard_negatives = []  # 使用统一的变量名
-                    self.hard_negatives_cache = []
-                    print_rank(f"GPU {rank}: Hard negatives file not found")
-            except Exception as e:
-                print_rank(f"GPU {rank}: Error loading hard negatives from file: {e}")
-                merged_hard_negatives = []  # 使用统一的变量名
-                self.hard_negatives_cache = []
+                    print_rank(f"⚠️ WARNING: Received no result from GPU {gpu_idx}")
+            
+            print_rank(f"Collected {len(final_hard_negatives)} total hard negatives.")
+            with open(self.hard_negatives_file, 'w') as f:
+                json.dump(final_hard_negatives, f, indent=2)
+            print_rank(f"✅ Saved hard negatives to {self.hard_negatives_file}")
+            self.hard_negatives_cache = final_hard_negatives
         
-        print_rank(f"🎯 Distributed hard negative collection completed: {len(merged_hard_negatives)} total samples")
-        return merged_hard_negatives
+        # 使用 broadcast_object_list 将最终列表广播给所有进程，确保大家返回的是同样的内容
+        # 这对于后续的数据集状态一致性非常重要
+        final_list_container = [final_hard_negatives if rank == 0 else []]
+        dist.broadcast_object_list(final_list_container, src=0)
+        
+        # 非rank 0 进程也需要更新缓存
+        if rank != 0:
+            self.hard_negatives_cache = final_list_container[0]
+        
+        print_rank(f"🎯 GPU {rank}: Distributed hard negative collection completed with {len(final_list_container[0])} total samples")
+        return final_list_container[0]
     
     def _run_retrieval_batch(self, model, batch, max_samples=None):
         """Run real retrieval for a batch of queries using the actual VLM2Vec model"""
@@ -863,266 +717,6 @@ class IterativeCIRRDataset(Dataset):
         final_embeddings = torch.cat(target_embeddings, dim=0)
         print_rank(f"   Final embeddings shape: {final_embeddings.shape}")
         return final_embeddings
-    
-    def _get_or_compute_target_embeddings_distributed(self, model):
-        """
-        分布式环境下获取或计算target embeddings - 真正的并行化实现
-        使用"并行计算-聚合"模式，所有GPU都参与计算
-        
-        Args:
-            model: 检索模型
-            
-        Returns:
-            完整的target_embeddings tensor
-        """
-        import torch.distributed as dist
-        
-        if not dist.is_initialized():
-            # 单卡模式
-            return self._get_or_compute_target_embeddings(
-                self.retrieval_candidates, model, 
-                getattr(model, 'processor', None),
-                getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
-                next(model.parameters()).device
-            )
-        
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        device = next(model.parameters()).device
-        
-        print_rank(f"GPU {rank}: Starting distributed target embeddings computation")
-        
-        # 先尝试从缓存加载（所有GPU都检查缓存）
-        cache_file = self._get_cache_file_path(self.retrieval_candidates)
-        
-        if os.path.exists(cache_file):
-            try:
-                print_rank(f"GPU {rank}: Loading cached target embeddings from {cache_file}")
-                cached_data = torch.load(cache_file, map_location=device, weights_only=True)
-                
-                # 验证缓存
-                if (cached_data['target_paths'] == self.retrieval_candidates and 
-                    cached_data['embeddings'].size(0) == len(self.retrieval_candidates)):
-                    embeddings = cached_data['embeddings'].to(device)
-                    
-                    # 确保数据类型与当前模型匹配（通常是bfloat16）
-                    model_dtype = next(model.parameters()).dtype
-                    embeddings = embeddings.to(dtype=model_dtype)
-                    
-                    print_rank(f"GPU {rank}: ✅ Successfully loaded {embeddings.size(0)} target embeddings from cache (dtype: {embeddings.dtype})")
-                    return embeddings
-                else:
-                    print_rank(f"GPU {rank}: Cache validation failed, will recompute")
-            except Exception as e:
-                print_rank(f"GPU {rank}: Error loading cache: {e}, will recompute")
-        
-        # 缓存不存在或无效，进行分布式计算
-        print_rank(f"Starting distributed target embeddings computation across {world_size} GPUs")
-        
-        # 1. 分配计算任务：将候选图像分割到各个GPU
-        total_candidates = len(self.retrieval_candidates)
-        candidates_per_gpu = (total_candidates + world_size - 1) // world_size
-        start_idx = rank * candidates_per_gpu
-        end_idx = min(start_idx + candidates_per_gpu, total_candidates)
-        
-        local_candidates = self.retrieval_candidates[start_idx:end_idx]
-        print_rank(f"GPU {rank}: Computing embeddings for candidates {start_idx}-{end_idx-1} ({len(local_candidates)} images)")
-        
-        # 2. 每个GPU计算自己分配的候选图像embeddings
-        if len(local_candidates) > 0:
-            local_embeddings = self._compute_target_embeddings_batch_local(
-                local_candidates, model, 
-                getattr(model, 'processor', None),
-                getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
-                device, rank
-            )
-        else:
-            # 创建空tensor（保持一致的维度）
-            local_embeddings = torch.empty(0, 768, device=device)  # 假设768维
-        
-        # 3. 等待一下确保所有GPU完成计算，然后继续文件式同步
-        print_rank(f"GPU {rank}: Completed local computation, starting file-based synchronization")
-        
-        # 4. 确定embedding维度，使用文件式同步
-        if local_embeddings.numel() > 0:
-            embedding_dim = local_embeddings.size(1)
-        else:
-            embedding_dim = 768  # 默认维度，后面会从文件中获得正确维度
-        
-        # 5. 准备保存到文件的embeddings
-        max_local_candidates = candidates_per_gpu
-        if local_embeddings.numel() > 0:
-            padded_embeddings = torch.zeros(max_local_candidates, local_embeddings.size(1), device=device)
-            actual_local_size = local_embeddings.size(0)
-            padded_embeddings[:actual_local_size] = local_embeddings
-        else:
-            # 空embeddings的占位符
-            padded_embeddings = torch.empty(0, 768, device=device)
-            actual_local_size = 0
-        
-        # 6. 文件式同步：避免NCCL all-gather超时问题
-        embeddings_sync_dir = os.path.join(self.experiment_dir, "sync_embeddings")
-        
-        # rank 0创建同步目录
-        if rank == 0:
-            os.makedirs(embeddings_sync_dir, exist_ok=True)
-            print_rank(f"GPU {rank}: Created embeddings sync directory: {embeddings_sync_dir}")
-        
-        # 等待同步目录创建
-        wait_count = 0
-        max_wait_dir = 60
-        while not os.path.exists(embeddings_sync_dir) and wait_count < max_wait_dir:
-            time.sleep(1)
-            wait_count += 1
-            if wait_count % 10 == 0:
-                print_rank(f"GPU {rank}: Waiting for embeddings sync directory... ({wait_count}s)")
-        
-        if not os.path.exists(embeddings_sync_dir):
-            print_rank(f"GPU {rank}: Creating embeddings sync directory locally...")
-            os.makedirs(embeddings_sync_dir, exist_ok=True)
-        
-        print_rank(f"GPU {rank}: Embeddings sync directory confirmed: {embeddings_sync_dir}")
-        
-        # 每个GPU保存自己的embeddings到文件
-        local_emb_file = os.path.join(embeddings_sync_dir, f"gpu_{rank}_embeddings.pt")
-        try:
-            torch.save({
-                'embeddings': padded_embeddings.cpu(),  # 移到CPU节省GPU内存
-                'actual_size': actual_local_size,
-                'rank': rank,
-                'timestamp': time.time()
-            }, local_emb_file)
-            print_rank(f"GPU {rank}: Saved local embeddings to {local_emb_file}")
-        except Exception as e:
-            print_rank(f"GPU {rank}: Error saving embeddings: {e}")
-        
-        # 文件式等待：等待所有GPU保存完成
-        print_rank(f"GPU {rank}: Waiting for all GPUs to save embeddings...")
-        max_emb_wait = 300  # 5分钟等待时间
-        emb_wait_start = time.time()
-        
-        while time.time() - emb_wait_start < max_emb_wait:
-            all_files_exist = True
-            missing_files = []
-            
-            # 先检查同步目录是否还存在（可能被其他GPU清理了）
-            if not os.path.exists(embeddings_sync_dir):
-                print_rank(f"GPU {rank}: Embeddings sync directory no longer exists, assuming completion")
-                # 检查是否有缓存文件（说明计算已完成）
-                if os.path.exists(cache_file):
-                    print_rank(f"GPU {rank}: Found cached embeddings, loading from cache")
-                    try:
-                        cached_data = torch.load(cache_file, map_location=device, weights_only=True)
-                        embeddings = cached_data['embeddings'].to(device)
-                        model_dtype = next(model.parameters()).dtype
-                        embeddings = embeddings.to(dtype=model_dtype)
-                        print_rank(f"GPU {rank}: ✅ Successfully loaded embeddings from cache after directory cleanup")
-                        return embeddings
-                    except Exception as e:
-                        print_rank(f"GPU {rank}: Error loading from cache: {e}")
-                        break
-                else:
-                    print_rank(f"GPU {rank}: No cache file found, will continue waiting")
-                    break
-            
-            for check_rank in range(world_size):
-                check_file = os.path.join(embeddings_sync_dir, f"gpu_{check_rank}_embeddings.pt")
-                if not os.path.exists(check_file):
-                    all_files_exist = False
-                    missing_files.append(check_rank)
-            
-            if all_files_exist:
-                print_rank(f"GPU {rank}: ✅ All GPU embeddings files ready")
-                break
-            
-            # 每30秒报告一次状态
-            elapsed = time.time() - emb_wait_start
-            if int(elapsed) % 30 == 0 and int(elapsed) > 0:
-                print_rank(f"GPU {rank}: Still waiting for embeddings files... Missing GPUs: {missing_files} (elapsed: {int(elapsed)}s)")
-            
-            time.sleep(2)
-        else:
-            print_rank(f"GPU {rank}: ❌ Timeout waiting for all GPU embeddings files")
-            # 尝试从缓存加载作为备选方案
-            if os.path.exists(cache_file):
-                try:
-                    cached_data = torch.load(cache_file, map_location=device, weights_only=True)
-                    embeddings = cached_data['embeddings'].to(device)
-                    model_dtype = next(model.parameters()).dtype
-                    embeddings = embeddings.to(dtype=model_dtype)
-                    print_rank(f"GPU {rank}: ✅ Loaded embeddings from cache as fallback")
-                    return embeddings
-                except Exception as e:
-                    print_rank(f"GPU {rank}: Fallback cache loading failed: {e}")
-            # 继续处理可用的文件
-        
-        # 从文件读取所有GPU的embeddings
-        embedding_list = []
-        for i in range(world_size):
-            emb_file = os.path.join(embeddings_sync_dir, f"gpu_{i}_embeddings.pt")
-            try:
-                if os.path.exists(emb_file):
-                    gpu_data = torch.load(emb_file, map_location=device, weights_only=True)
-                    gpu_embeddings = gpu_data['embeddings'].to(device)
-                    embedding_list.append(gpu_embeddings)
-                    print_rank(f"GPU {rank}: Loaded embeddings from GPU {i} (shape: {gpu_embeddings.shape})")
-                else:
-                    print_rank(f"GPU {rank}: No embeddings file found for GPU {i}")
-                    # 创建占位符embeddings
-                    placeholder = torch.zeros_like(padded_embeddings)
-                    embedding_list.append(placeholder)
-            except Exception as e:
-                print_rank(f"GPU {rank}: Error loading embeddings from GPU {i}: {e}")
-                # 创建占位符embeddings
-                placeholder = torch.zeros_like(padded_embeddings)
-                embedding_list.append(placeholder)
-        
-        print_rank(f"GPU {rank}: ✅ Successfully loaded embeddings from all GPUs via file synchronization")
-        
-        # 清理临时embeddings文件（rank 0负责清理，但要等所有GPU完成读取）
-        if rank == 0:
-            # 等待一下确保所有GPU完成文件读取
-            time.sleep(5)
-            try:
-                import shutil
-                if os.path.exists(embeddings_sync_dir):
-                    shutil.rmtree(embeddings_sync_dir)
-                    print_rank(f"GPU {rank}: Cleaned up embeddings sync directory")
-            except Exception as e:
-                print_rank(f"GPU {rank}: Warning: Could not clean up embeddings sync directory: {e}")
-        
-        # 7. 重建完整的embeddings矩阵
-        all_embeddings = []
-        for i, emb in enumerate(embedding_list):
-            gpu_start = i * candidates_per_gpu
-            gpu_end = min(gpu_start + candidates_per_gpu, total_candidates)
-            actual_size = gpu_end - gpu_start
-            if actual_size > 0:
-                all_embeddings.append(emb[:actual_size])
-        
-        full_embeddings = torch.cat(all_embeddings, dim=0)
-        print_rank(f"GPU {rank}: ✅ Reconstructed {full_embeddings.size(0)} target embeddings via distributed computation")
-        
-        # 8. 只有rank 0保存缓存（避免并发写入冲突）
-        if rank == 0:
-            try:
-                cache_data = {
-                    'target_paths': self.retrieval_candidates,
-                    'embeddings': full_embeddings.cpu(),
-                    'timestamp': time.time(),
-                    'model_backbone': getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
-                    'computed_by': 'distributed'
-                }
-                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-                torch.save(cache_data, cache_file)
-                print_rank(f"💾 Cached distributed target embeddings to {cache_file}")
-            except Exception as e:
-                print_rank(f"Warning: Failed to cache embeddings: {e}")
-        
-        # 9. 文件系统延迟，确保缓存文件写入完成
-        time.sleep(1)
-        
-        return full_embeddings
     
     def _compute_target_embeddings_batch_local(self, target_candidates, model, processor, model_backbone, device, rank=0):
         """
@@ -1799,7 +1393,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 等待同步目录创建完成（文件轮询）
         wait_count = 0
-        max_wait_dir = 60  # 最多等待60秒
+        max_wait_dir = 120  # 2分钟等待目录创建
         while not os.path.exists(sync_dir) and wait_count < max_wait_dir:
             time.sleep(1)
             wait_count += 1
@@ -1831,7 +1425,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 等待所有GPU完成（文件轮询）
         print_rank(f"GPU {rank}: Waiting for all GPUs to complete caption generation...")
-        max_wait_time = 1800  # 30分钟最大等待时间
+        max_wait_time = 3600  # 60分钟最大等待时间（caption生成非常耗时）
         start_wait = time.time()
         
         while time.time() - start_wait < max_wait_time:
@@ -1848,8 +1442,8 @@ class IterativeCIRRDataset(Dataset):
             
             time.sleep(5)  # 每5秒检查一次
             
-            # 每分钟打印一次等待状态
-            if int(time.time() - start_wait) % 60 == 0:
+            # 每2分钟打印一次等待状态（由于等待时间较长，增加报告频率）
+            if int(time.time() - start_wait) % 120 == 0:
                 completed_gpus = []
                 for check_rank in range(world_size):
                     check_file = os.path.join(sync_dir, f"gpu_{check_rank}_completed.txt")
@@ -1871,7 +1465,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 等待目录创建完成（文件轮询）
         wait_count = 0
-        max_wait_temp = 60  # 最多等待60秒
+        max_wait_temp = 120  # 2分钟等待临时目录创建
         while not os.path.exists(temp_dir) and wait_count < max_wait_temp:
             time.sleep(1)
             wait_count += 1
@@ -1900,7 +1494,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 文件式同步：等待所有GPU完成文件写入
         print_rank(f"GPU {rank}: Waiting for all GPUs to save their files...")
-        max_file_wait = 120  # 减少到2分钟最大等待时间
+        max_file_wait = 600  # 10分钟最大等待时间（文件保存也可能较慢）
         file_wait_start = time.time()
         
         while time.time() - file_wait_start < max_file_wait:
@@ -1916,10 +1510,21 @@ class IterativeCIRRDataset(Dataset):
                 print_rank(f"GPU {rank}: ✅ All GPU files are ready")
                 break
             
-            # 每30秒打印一次等待状态，帮助调试
+            # 每60秒打印一次等待状态，帮助调试
             elapsed = time.time() - file_wait_start
-            if int(elapsed) % 30 == 0 and int(elapsed) > 0:
+            if int(elapsed) % 60 == 0 and int(elapsed) > 0:
                 print_rank(f"GPU {rank}: Still waiting for GPU files... Missing GPUs: {missing_files} (elapsed: {int(elapsed)}s)")
+                # 每5分钟提供更详细的文件状态信息
+                if int(elapsed) % 300 == 0:
+                    print_rank(f"GPU {rank}: Detailed file status check at {int(elapsed)}s:")
+                    for check_rank in range(world_size):
+                        check_file = os.path.join(temp_dir, f"gpu_{check_rank}_samples.json")
+                        exists = os.path.exists(check_file)
+                        try:
+                            size = os.path.getsize(check_file) if exists else 0
+                            print_rank(f"GPU {rank}: - GPU {check_rank}: exists={exists}, size={size} bytes")
+                        except:
+                            print_rank(f"GPU {rank}: - GPU {check_rank}: exists={exists}, size=unknown")
             
             time.sleep(2)  # 每2秒检查一次
         else:
@@ -2002,7 +1607,7 @@ class IterativeCIRRDataset(Dataset):
         print_rank(f"GPU {rank}: Waiting for final augmented samples file...")
         
         final_wait_start = time.time()
-        max_final_wait = 60  # 减少到1分钟最大等待时间
+        max_final_wait = 300  # 5分钟最大等待时间（文件合并和写入）
         
         while time.time() - final_wait_start < max_final_wait:
             if os.path.exists(final_aug_file):

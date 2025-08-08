@@ -371,10 +371,6 @@ def main():
                 else:
                     # Use production mode settings
                     # 🔧 Use new parameter name: steps_per_iteration instead of production_max_steps
-                    print_master(f"DEBUG: config keys = {list(config.keys())}")
-                    print_master(f"DEBUG: steps_per_iteration in config = {'steps_per_iteration' in config}")
-                    print_master(f"DEBUG: config.get('steps_per_iteration') = {config.get('steps_per_iteration')}")
-                    
                     steps_per_iter = config.get('steps_per_iteration', config.get('production_max_steps', 1000))
                     iterative_params.update({
                         'steps_per_iteration': steps_per_iter,  # New parameter name
