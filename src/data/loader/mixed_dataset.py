@@ -5,6 +5,19 @@ from src.data.dataset.hf_datasets import interleave_datasets
 from src.utils import print_master
 import torch
 
+# Import iterative datasets
+# from ..dataset.composed_retrieval_dataset import IterativeCIRRDataset, IterativeFashionIQDataset
+
+from ..dataset.cirr import IterativeCIRRDataset
+from ..dataset.fashioniq import IterativeFashionIQDataset
+from ..dataset.nhr_edit_dataset import IterativeNHREditDataset
+
+DATASET_PARSERS = {
+    'IterativeCIRRDataset': IterativeCIRRDataset,
+    'IterativeFashionIQDataset': IterativeFashionIQDataset,
+    'IterativeNHREditDataset': IterativeNHREditDataset,
+}
+
 def init_mixed_dataset(dataset_config, model_args, data_args, training_args):
     weights = [d['weight'] for d in dataset_config.values()]
     w_sum = sum(weights)

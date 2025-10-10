@@ -122,15 +122,47 @@ def load_processor(model_args, data_args=None):
         from src.model.vlm_backbone.qwen2_vl.processing_qwen2_vl import Qwen2VLProcessor
         from src.model.vlm_backbone.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
         from src.model.vlm_backbone.qwen2_vl.tokenization_qwen2_fast import Qwen2TokenizerFast
-        min_pixels, max_pixels = None, None
+
+        # 1) 读取配置
+        do_resize = True
+        min_pixels = 56*56          # 默认最小面积：与官方一致（3136）
+        max_pixels = 28*28*1280     # 默认最大面积：与官方一致（1003520）
         if data_args is not None:
-            min_pixels, max_pixels = data_args.resize_min_pixels, data_args.resize_max_pixels
-        size = {"shortest_edge": min_pixels, "longest_edge": max_pixels}
-        image_processor = Qwen2VLImageProcessor.from_pretrained(model_name_or_path, size=size)
+            do_resize = data_args.resize_use_processor
+            if getattr(data_args, "resize_min_pixels", None) is not None:
+                min_pixels = int(data_args.resize_min_pixels)
+            if getattr(data_args, "resize_max_pixels", None) is not None:
+                max_pixels = int(data_args.resize_max_pixels)
+
+        # 2) 载入
+        image_processor = Qwen2VLImageProcessor.from_pretrained(model_name_or_path)
+
+        # 3) 统一设置：属性 + size 两处都覆盖，且只用官方认可的两个键
+        if hasattr(image_processor, "do_resize"):
+            image_processor.do_resize = do_resize
+        if hasattr(image_processor, "min_pixels"):
+            image_processor.min_pixels = min_pixels
+        if hasattr(image_processor, "max_pixels"):
+            image_processor.max_pixels = max_pixels
+
+        # # 注意：size 的键是“面积”，不是边长
+        # image_processor.size = {
+        #     "shortest_edge": min_pixels,   # 最小面积
+        #     "longest_edge":  max_pixels    # 最大面积
+        # }
+
         tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
         processor = Qwen2VLProcessor.from_pretrained(
             model_name_or_path,
-            image_processor=image_processor, tokenizer=tokenizer, size=size
+            image_processor=image_processor,
+            tokenizer=tokenizer
+        )
+        ip = processor.image_processor
+        print_master(
+            f"[Qwen2VL] do_resize={getattr(ip,'do_resize',None)}, "
+            f"size={getattr(ip,'size',None)}, "
+            f"min_pixels={getattr(ip,'min_pixels',None)}, "
+            f"max_pixels={getattr(ip,'max_pixels',None)}"
         )
     elif model_args.model_backbone == QWEN2_VL_TOKENSELECTION:
         from src.model.vlm_backbone.qwen2_vl_tokenselection.processing_qwen2_vl import Qwen2VLProcessor
@@ -153,30 +185,111 @@ def load_processor(model_args, data_args=None):
         from src.model.vlm_backbone.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
         from src.model.vlm_backbone.qwen2_5_vl.image_processing_qwen2_5_vl import Qwen2_5_VLImageProcessor
         from src.model.vlm_backbone.qwen2_vl.tokenization_qwen2_fast import Qwen2TokenizerFast
-        min_pixels, max_pixels = None, None
+
+        # 读取用户参数（允许 None -> 使用模型默认）
+        user_do_resize = True
+        user_min_pixels = None
+        user_max_pixels = None
         if data_args is not None:
-            min_pixels, max_pixels = data_args.resize_min_pixels, data_args.resize_max_pixels
-        size = {"shortest_edge": min_pixels, "longest_edge": max_pixels, "min_pixels": min_pixels, "max_pixels": max_pixels}
-        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(model_name_or_path, size=size)
+            user_do_resize = data_args.resize_use_processor
+            user_min_pixels = getattr(data_args, 'resize_min_pixels', None)
+            user_max_pixels = getattr(data_args, 'resize_max_pixels', None)
+
+        # 先按模型默认加载（会读取 preprocessor_config.json）
+        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(model_name_or_path)
+
+        # 采集模型默认值
+        default_min = getattr(image_processor, 'min_pixels', None)
+        default_max = getattr(image_processor, 'max_pixels', None)
+
+        # 计算最终值（用户优先）
+        final_min = int(user_min_pixels) if user_min_pixels is not None else default_min
+        final_max = int(user_max_pixels) if user_max_pixels is not None else default_max
+
+        # 覆盖属性
+        if hasattr(image_processor, 'do_resize'):
+            image_processor.do_resize = user_do_resize
+        if hasattr(image_processor, 'min_pixels') and final_min is not None:
+            image_processor.min_pixels = final_min
+        if hasattr(image_processor, 'max_pixels') and final_max is not None:
+            image_processor.max_pixels = final_max
+
+        # 同步 size 字典（不同版本字段可能不同，做存在性检查）
+        if hasattr(image_processor, 'size') and isinstance(image_processor.size, dict):
+            if final_min is not None:
+                image_processor.size['min_pixels'] = final_min
+                if 'shortest_edge' in image_processor.size:
+                    image_processor.size['shortest_edge'] = final_min
+            if final_max is not None:
+                image_processor.size['max_pixels'] = final_max
+                if 'longest_edge' in image_processor.size:
+                    image_processor.size['longest_edge'] = final_max
+
         tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
-        processor = Qwen2_5_VLProcessor.from_pretrained(model_name_or_path, image_processor=image_processor, tokenizer=tokenizer)
+        processor = Qwen2_5_VLProcessor.from_pretrained(
+            model_name_or_path,
+            image_processor=image_processor,
+            tokenizer=tokenizer
+        )
+        ip = processor.image_processor
+        print_master(
+            f"[Qwen2_5_VL] do_resize={getattr(ip,'do_resize',None)}, size={getattr(ip,'size',None)}, "
+            f"min_pixels={getattr(ip,'min_pixels',None)}, max_pixels={getattr(ip,'max_pixels',None)} "
+            f"(user_min={user_min_pixels}, user_max={user_max_pixels}, default_min={default_min}, default_max={default_max})"
+        )
     elif model_args.model_backbone == QWEN2_5_VL_TOKENSELECTION:
         # TODO: qwen2.5 token selection not working yet
         from src.model.vlm_backbone.qwen2_5_vl_tokenselection.processing_qwen2_5_vl import Qwen2_5_VLProcessor
         from src.model.vlm_backbone.qwen2_5_vl_tokenselection.image_processing_qwen2_5_vl import Qwen2_5_VLImageProcessor
         from src.model.vlm_backbone.qwen2_vl_tokenselection.tokenization_qwen2_fast import Qwen2TokenizerFast
-        min_pixels, max_pixels = None, None
+
+        user_do_resize = True
+        user_min_pixels = None
+        user_max_pixels = None
         if data_args is not None:
-            min_pixels, max_pixels = data_args.resize_min_pixels, data_args.resize_max_pixels
-        size = {"shortest_edge": min_pixels, "longest_edge": max_pixels, "min_pixels": min_pixels, "max_pixels": max_pixels}
-        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(model_name_or_path, size=size)
+            user_do_resize = data_args.resize_use_processor
+            user_min_pixels = getattr(data_args, 'resize_min_pixels', None)
+            user_max_pixels = getattr(data_args, 'resize_max_pixels', None)
+
+        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(model_name_or_path)
+
+        default_min = getattr(image_processor, 'min_pixels', None)
+        default_max = getattr(image_processor, 'max_pixels', None)
+        final_min = int(user_min_pixels) if user_min_pixels is not None else default_min
+        final_max = int(user_max_pixels) if user_max_pixels is not None else default_max
+
+        if hasattr(image_processor, 'do_resize'):
+            image_processor.do_resize = user_do_resize
+        if hasattr(image_processor, 'min_pixels') and final_min is not None:
+            image_processor.min_pixels = final_min
+        if hasattr(image_processor, 'max_pixels') and final_max is not None:
+            image_processor.max_pixels = final_max
+        if hasattr(image_processor, 'size') and isinstance(image_processor.size, dict):
+            if final_min is not None:
+                image_processor.size['min_pixels'] = final_min
+                if 'shortest_edge' in image_processor.size:
+                    image_processor.size['shortest_edge'] = final_min
+            if final_max is not None:
+                image_processor.size['max_pixels'] = final_max
+                if 'longest_edge' in image_processor.size:
+                    image_processor.size['longest_edge'] = final_max
+
         tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
         processor = Qwen2_5_VLProcessor.from_pretrained(
             model_name_or_path,
-            image_processor=image_processor, tokenizer=tokenizer,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
             uigraph_use=model_args.uigraph_use,
-            uigraph_diff=model_args.uigraph_diff,  uigraph_rand=model_args.uigraph_rand,
-            uimask_ratio=model_args.uimask_ratio, uimask_rand=model_args.uimask_rand
+            uigraph_diff=model_args.uigraph_diff,
+            uigraph_rand=model_args.uigraph_rand,
+            uimask_ratio=model_args.uimask_ratio,
+            uimask_rand=model_args.uimask_rand
+        )
+        ip = processor.image_processor
+        print_master(
+            f"[Qwen2_5_VL_TS] do_resize={getattr(ip,'do_resize',None)}, size={getattr(ip,'size',None)}, "
+            f"min_pixels={getattr(ip,'min_pixels',None)}, max_pixels={getattr(ip,'max_pixels',None)} "
+            f"(user_min={user_min_pixels}, user_max={user_max_pixels}, default_min={default_min}, default_max={default_max})"
         )
     elif model_args.model_backbone == INTERNVIDEO2:
         return None
@@ -338,8 +451,6 @@ def Qwen2_VL_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_len
                         max_length=None, 
                         truncation=False, 
                         input_data_format=ChannelDimension.LAST,
-                        min_pixels=28*28*4,
-                        max_pixels=28*28*1280  # Set default max_pixels
                     )
                 elif vlm_video_token in text:
                     # TODO: check text/video data validity
@@ -350,8 +461,6 @@ def Qwen2_VL_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_len
                         max_length=None, 
                         truncation=False, 
                         input_data_format=ChannelDimension.LAST,
-                        min_pixels=28*28*4,
-                        max_pixels=28*28*1280  # Set default max_pixels
                     )
                 else:
                     raise NotImplementedError(f"No visual token found ({vlm_image_token} or {vlm_video_token}) in the text: {text}")

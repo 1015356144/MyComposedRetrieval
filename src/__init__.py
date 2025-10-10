@@ -16,14 +16,11 @@ from . import trainer_iterative
 # Main classes
 from .trainer_iterative import IterativeRetrievalTrainer
 from .data.dataset.composed_retrieval_dataset import IterativeCIRRDataset, IterativeFashionIQDataset
-from .data.dataset.composed_retrieval_dataset_simple import SimpleCIRRDataset, SimpleFashionIQDataset
 
 __all__ = [
     'IterativeRetrievalTrainer',
     'IterativeCIRRDataset',
     'IterativeFashionIQDataset',
-    'SimpleCIRRDataset', 
-    'SimpleFashionIQDataset',
     'data',
     'model',
     'utils'

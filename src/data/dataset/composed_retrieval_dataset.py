@@ -311,16 +311,148 @@ class IterativeCIRRDataset(Dataset):
 
     def collect_hard_negatives_batch_distributed(self, retrieval_model, batch_size: int = 8, max_samples: int = None):
         """
-        (最终合并重构版) 分布式硬负样本收集。
+        (最小改动版) 分布式硬负样本收集：
+        仅 rank0 计算整库 target embeddings 并落盘，其它 rank 不进入 barrier，轮询等待文件生成后再加载；
+        避免长时间 barrier 导致 NCCL watchdog 超时。
+        """
+        import torch.distributed as dist
+        import time
+        from datetime import datetime
+        if not dist.is_initialized():
+            return self.collect_hard_negatives_batch(retrieval_model, batch_size, max_samples)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        print_rank(f"GPU {rank}: Starting minimal-change distributed hard negative collection (Iter {self.iteration_round})")
+        # 若已有最终硬负样本文件直接加载
+        if os.path.exists(self.hard_negatives_file):
+            try:
+                with open(self.hard_negatives_file, 'r') as f:
+                    hard_negatives = json.load(f)
+                if max_samples is not None and len(hard_negatives) > max_samples:
+                    hard_negatives = hard_negatives[:max_samples]
+                self.hard_negatives_cache = hard_negatives
+                print_rank(f"GPU {rank}: Loaded existing hard negatives ({len(hard_negatives)})")
+                return hard_negatives
+            except Exception as e:
+                print_rank(f"GPU {rank}: Failed loading existing hard negatives, will recompute: {e}")
+        target_embeddings_cache_file = self._get_cache_file_path(self.retrieval_candidates)
+        done_flag = target_embeddings_cache_file + '.done'
+        # rank0 计算
+        if rank == 0:
+            print_rank("GPU 0: Computing / loading target embeddings (single-process)...")
+            start_t = time.time()
+            self._get_or_compute_target_embeddings(
+                self.retrieval_candidates,
+                retrieval_model,
+                getattr(retrieval_model, 'processor', None),
+                getattr(self.model_args, 'model_backbone', 'qwen2_vl'),
+                'cuda:0' if torch.cuda.is_available() else 'cpu'
+            )
+            # 写完成标志（先确保主文件存在）
+            if not os.path.exists(target_embeddings_cache_file):
+                raise RuntimeError(f"GPU 0: Expected embeddings file not found after computation: {target_embeddings_cache_file}")
+            with open(done_flag, 'w') as f:
+                f.write(datetime.utcnow().isoformat())
+            print_rank(f"GPU 0: Target embeddings ready. File + flag written. Time {(time.time()-start_t)/60:.1f} min")
+        else:
+            print_rank(f"GPU {rank}: Waiting for embeddings flag file (no barrier)")
+        # 其它 rank 轮询等待
+        if rank != 0:
+            poll_start = time.time()
+            max_wait = 3 * 3600  # 最长等待 3 小时
+            last_log = 0
+            while True:
+                if os.path.exists(done_flag) and os.path.exists(target_embeddings_cache_file):
+                    try:
+                        # 试读一次防止写尚未完成
+                        _ = os.path.getsize(target_embeddings_cache_file)
+                        time.sleep(1)  # small grace
+                        break
+                    except Exception:
+                        time.sleep(2)
+                        continue
+                time.sleep(2)
+                waited = time.time() - poll_start
+                if waited - last_log > 60:
+                    print_rank(f"GPU {rank}: Still waiting embeddings... waited {int(waited//60)}m")
+                    last_log = waited
+                if waited > max_wait:
+                    raise TimeoutError(f"GPU {rank}: Timeout waiting embeddings (> {max_wait/3600:.1f}h)")
+        # 全部加载
+        try:
+            cached_data = torch.load(target_embeddings_cache_file, map_location=device)
+            target_embeddings = cached_data['embeddings'].to(next(retrieval_model.parameters()).dtype)
+            print_rank(f"GPU {rank}: Loaded shared target embeddings: {target_embeddings.shape}")
+        except Exception as e:
+            raise RuntimeError(f"GPU {rank}: Failed to load embeddings after flag present: {e}")
+        # 查询划分
+        sample_annotations = self.annotations[:max_samples] if max_samples is not None else self.annotations
+        total_samples = len(sample_annotations)
+        samples_per_gpu = (total_samples + world_size - 1) // world_size
+        start_idx = rank * samples_per_gpu
+        end_idx = min(start_idx + samples_per_gpu, total_samples)
+        local_annotations = sample_annotations[start_idx:end_idx]
+        print_rank(f"GPU {rank}: Assigned {len(local_annotations)} / {total_samples} queries")
+        retrieval_model.eval()
+        local_hard_negatives = []
+        if local_annotations:
+            with torch.no_grad():
+                for i in range(0, len(local_annotations), batch_size):
+                    batch_annotations = local_annotations[i:i+batch_size]
+                    batch_num = i // batch_size + 1
+                    total_batches = (len(local_annotations) + batch_size - 1)//batch_size
+                    print_rank(f"GPU {rank}: Query batch {batch_num}/{total_batches}")
+                    batch = []
+                    for ann in batch_annotations:
+                        batch.append({
+                            'reference_image': self.image_splits.get(ann['reference'], ann['reference']),
+                            'modification_text': ann['caption'],
+                            'target_image': self.image_splits.get(ann['target_hard'], ann['target_hard'])
+                        })
+                    try:
+                        start_time = time.time()
+                        retrieval_results = self._run_real_retrieval_with_cached_targets(
+                            retrieval_model, batch, target_embeddings, max_samples
+                        )
+                        batch_hard_negs = self._identify_hard_negatives(batch, retrieval_results)
+                        local_hard_negatives.extend(batch_hard_negs)
+                        print_rank(f"GPU {rank}: Batch {batch_num} done ({time.time()-start_time:.1f}s), hard_negs +{len(batch_hard_negs)}")
+                    except Exception as e:
+                        print_rank(f"GPU {rank}: Error batch {batch_num}: {e}")
+                        continue
+        else:
+            print_rank(f"GPU {rank}: No queries assigned (idle)")
+        # 收集结果 (仍需一次同步，可接受；若 rank0 很慢这里只发生在查询阶段之后)
+        gathered = [None] * world_size
+        try:
+            dist.all_gather_object(gathered, local_hard_negatives)
+        except Exception as e:
+            print_rank(f"GPU {rank}: all_gather_object failed: {e}")
+            gathered = [[] for _ in range(world_size)]
+            gathered[rank] = local_hard_negatives
+        final_hard_negatives = []
+        if rank == 0:
+            for gidx, gres in enumerate(gathered):
+                if gres is not None:
+                    final_hard_negatives.extend(gres)
+            with open(self.hard_negatives_file, 'w') as f:
+                json.dump(final_hard_negatives, f, indent=2)
+            print_rank(f"GPU 0: Saved {len(final_hard_negatives)} hard negatives -> {self.hard_negatives_file}")
+            self.hard_negatives_cache = final_hard_negatives
+        # 广播最终结果
+        broadcast_container = [final_hard_negatives if rank == 0 else []]
+        dist.broadcast_object_list(broadcast_container, src=0)
+        if rank != 0:
+            self.hard_negatives_cache = broadcast_container[0]
+        print_rank(f"GPU {rank}: Done. Total hard negatives = {len(self.hard_negatives_cache)}")
+        return self.hard_negatives_cache
+    
+    def collect_hard_negatives_batch_old(self, retrieval_model, batch_size: int = 8, max_samples: int = None):
+        """
+        (旧版) 分布式硬负样本收集。
         
-        该版本将特征计算和硬负样本挖掘的逻辑整合在一起，遵循以下稳健且高效的流程：
-        1.  Rank 0 负责计算或加载完整的候选图片特征集 (target_embeddings)。
-        2.  Rank 0 将特征保存到共享缓存文件。
-        3.  使用 dist.barrier() 确保所有进程等待 Rank 0 完成。
-        4.  所有进程从共享缓存文件加载完整的特征集到各自的显存中。
-        5.  每个进程独立、并行地处理分配给自己的查询任务。
-        6.  使用高效的 dist.all_gather_object 收集所有进程的硬负样本结果。
-        7.  Rank 0 汇总结果并保存最终文件。
+        该版本与 collect_hard_negatives_batch_distributed 功能相同，但实现方式不同。
         """
         import torch.distributed as dist
         import time
@@ -333,7 +465,7 @@ class IterativeCIRRDataset(Dataset):
         world_size = dist.get_world_size()
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         
-        print_rank(f"GPU {rank}: Starting optimized hard negative collection (Iteration {self.iteration_round})")
+        print_rank(f"GPU {rank}: Starting distributed hard negative collection (Iteration {self.iteration_round})")
 
         # 检查是否已有最终缓存文件
         if os.path.exists(self.hard_negatives_file):
@@ -647,7 +779,7 @@ class IterativeCIRRDataset(Dataset):
         target_embeddings = self._compute_target_embeddings_batch(
             target_database, model, processor, model_backbone, device
         )
-        
+            
         # 保存到缓存
         try:
             cache_data = {
@@ -1023,106 +1155,6 @@ class IterativeCIRRDataset(Dataset):
         
         return self._prepare_vlm_inputs(image_paths, texts, processor, model_backbone, device, "query")
     
-    def _process_batch_for_model(self, batch_dict, processor, device, is_query=False):
-        """Process batch data for model input using VLM2Vec's approach"""
-        try:
-            # Use processor to prepare the inputs properly
-            if is_query:
-                texts = batch_dict.get('query_text', [])
-                images = []
-                # Extract image paths from VLM2Vec format
-                for img_data in batch_dict.get('query_image', []):
-                    if isinstance(img_data, dict) and 'paths' in img_data:
-                        img_path = img_data['paths'][0]
-                        if img_path != "dummy_image" and os.path.exists(img_path):
-                            from PIL import Image
-                            images.append(Image.open(img_path).convert('RGB'))
-                        else:
-                            # Create a dummy image
-                            images.append(Image.new('RGB', (224, 224), color='white'))
-                    else:
-                        # Fallback to dummy image
-                        from PIL import Image
-                        images.append(Image.new('RGB', (224, 224), color='white'))
-            else:
-                texts = batch_dict.get('pos_text', [])
-                images = []
-                # Extract image paths from VLM2Vec format
-                for img_data in batch_dict.get('pos_image', []):
-                    if isinstance(img_data, dict) and 'paths' in img_data:
-                        img_path = img_data['paths'][0]
-                        if img_path != "dummy_image" and os.path.exists(img_path):
-                            from PIL import Image
-                            images.append(Image.open(img_path).convert('RGB'))
-                        else:
-                            # Create a dummy image
-                            images.append(Image.new('RGB', (224, 224), color='white'))
-                    else:
-                        # Fallback to dummy image
-                        from PIL import Image
-                        images.append(Image.new('RGB', (224, 224), color='white'))
-            
-            # Ensure we have the same number of texts and images
-            if len(texts) == 0 and len(images) > 0:
-                texts = [""] * len(images)
-            elif len(images) == 0 and len(texts) > 0:
-                from PIL import Image
-                images = [Image.new('RGB', (224, 224), color='white')] * len(texts)
-            
-            # For Qwen2-VL, we need to format the input properly
-            # Check if this is Qwen2-VL model
-            model_backbone = getattr(self.model_args, 'model_backbone', 'qwen2_vl')
-            
-            if model_backbone == 'qwen2_vl':
-                # For Qwen2-VL, prepare input in the expected format
-                processed = processor(
-                    text=texts,
-                    images=images,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                )
-            else:
-                # Use standard format for other models
-                processed = processor(
-                    text=texts,
-                    images=images,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                )
-            
-            # Move to device
-            for key in processed:
-                if hasattr(processed[key], 'to'):
-                    processed[key] = processed[key].to(device)
-            
-            # Add required fields for VLM2Vec models that expect them
-            if 'texts' not in processed and len(texts) > 0:
-                processed['texts'] = texts
-            if 'images' not in processed and len(images) > 0:
-                processed['images'] = images
-            
-            return processed
-            
-        except Exception as e:
-            print_rank(f"Error in _process_batch_for_model: {e}")
-            import traceback
-            print_rank(f"Full traceback: {traceback.format_exc()}")
-            # Return dummy processed data that works with MMEBModel.encode_input
-            batch_size = len(batch_dict.get('query_text' if is_query else 'pos_text', []))
-            if batch_size == 0:
-                batch_size = 1
-            return {
-                'input_ids': torch.zeros((batch_size, 512), dtype=torch.long).to(device),
-                'attention_mask': torch.ones((batch_size, 512), dtype=torch.long).to(device),
-                'pixel_values': torch.randn((batch_size, 3, 224, 224)).to(device),
-                'texts': [""] * batch_size,
-                'images': [None] * batch_size
-            }
-    
     def _run_simplified_retrieval(self, batch):
         """Fallback simplified retrieval with dummy results"""
         print_rank("Running simplified retrieval (fallback)")
@@ -1153,8 +1185,8 @@ class IterativeCIRRDataset(Dataset):
         
         return dummy_results
     
-    def _identify_hard_negatives(self, batch, retrieval_results, k=5):
-        """Identify hard negatives from retrieval results (supports both real and simulated)"""
+    def _identify_hard_negatives(self, batch, retrieval_results):
+        """Identify hard negatives from retrieval results with reference image filtering"""
         hard_negatives = []
         
         top_k_indices = retrieval_results['top_k_indices']
@@ -1168,94 +1200,107 @@ class IterativeCIRRDataset(Dataset):
         for idx, (query, gt_target, top_k, sims) in enumerate(zip(
             batch, gt_indices, top_k_indices, similarities
         )):
-            # Handle ground truth position
+            # 🔥 新增：过滤掉参考图像本身
+            query_ref_path = query['reference_image']
+            filtered_hard_negatives = []
+            
+            # Helper function to check if two images are the same
+            def is_same_image(path1, path2):
+                """Check if two image paths refer to the same image"""
+                if not path1 or not path2:
+                    return False
+                
+                # Convert to full paths for comparison
+                full_path1 = self._get_full_image_path(path1)
+                full_path2 = self._get_full_image_path(path2)
+                
+                # Normalize paths to handle symlinks, '../' etc.
+                try:
+                    norm_path1 = os.path.normpath(os.path.realpath(full_path1))
+                    norm_path2 = os.path.normpath(os.path.realpath(full_path2))
+                    return norm_path1 == norm_path2
+                except:
+                    # Fallback to simple basename comparison
+                    return os.path.basename(path1) == os.path.basename(path2)
+            
+            # 🔥 Process each retrieved result and filter
+            def process_negative_candidate(neg_pos, neg_idx, gt_position=-1):
+                """Process a negative candidate and add if valid"""
+                if is_real_retrieval:
+                    hard_negative_image = target_paths[neg_idx] if neg_idx < len(target_paths) else f"target_{neg_idx}"
+                else:
+                    hard_negative_image = neg_idx
+                
+                # 🔥 关键过滤：检查是否为参考图像本身
+                if is_real_retrieval and is_same_image(query_ref_path, hard_negative_image):
+                    print_rank(f"Filtered out reference image as hard negative: {query_ref_path}")
+                    return False  # 跳过这个候选
+                
+                # 🔥 可选：额外的过滤条件
+                # 检查是否与ground truth相同（避免将正样本当作负样本）
+                if is_real_retrieval and 'target_image' in query and is_same_image(query['target_image'], hard_negative_image):
+                    print_rank(f"Filtered out ground truth as hard negative: {hard_negative_image}")
+                    return False
+                
+                # 添加有效的硬负样本
+                filtered_hard_negatives.append({
+                    'reference_image': query['reference_image'],
+                    'modification_text': query['modification_text'],
+                    'target_image': query['target_image'],  # GT
+                    'hard_negative_image': hard_negative_image,
+                    'rank_position': neg_pos + 1,
+                    'gt_rank': gt_position + 1 if gt_position >= 0 else -1,
+                    'similarity_score': sims[neg_pos] if neg_pos < len(sims) else 0.0,
+                    'is_real_retrieval': is_real_retrieval
+                })
+                return True
+            
+            # Handle different GT scenarios with filtering
+            collected_negatives = 0  # 跟踪收集到的有效负样本数量
+            max_negatives = 5       # 最大负样本数量
+            
             if gt_target == -1:
-                # GT not found in retrieval database, all top results are hard negatives
-                for neg_pos in range(min(3, len(top_k))):
-                    neg_idx = top_k[neg_pos]
-                    
-                    if is_real_retrieval:
-                        # Use actual target path
-                        hard_negative_image = target_paths[neg_idx] if neg_idx < len(target_paths) else f"target_{neg_idx}"
-                    else:
-                        # Use simulated index
-                        hard_negative_image = neg_idx
-                    
-                    hard_negatives.append({
-                        'reference_image': query['reference_image'],
-                        'modification_text': query['modification_text'],
-                        'target_image': query['target_image'],  # GT
-                        'hard_negative_image': hard_negative_image,
-                        'rank_position': neg_pos + 1,
-                        'gt_rank': -1,  # GT not found
-                        'similarity_score': sims[neg_pos] if neg_pos < len(sims) else 0.0,
-                        'is_real_retrieval': is_real_retrieval
-                    })
+                # GT not found in retrieval database, all top results are potential hard negatives
+                for neg_pos in range(min(len(top_k), 10)):  # 检查更多候选以补偿过滤
+                    if collected_negatives >= max_negatives:
+                        break
+                    if process_negative_candidate(neg_pos, top_k[neg_pos]):
+                        collected_negatives += 1
+                        
             elif gt_target in top_k:
                 gt_position = top_k.index(gt_target)
                 
-                # If GT is not in top-1 but within top-k, collect hard negatives
-                if gt_position > 0 and gt_position < k:
-                    # All results ranked higher than GT are hard negatives
+                # If GT is not in top-1 but within top-k, collect hard negatives ranked higher
+                if gt_position > 0 :
                     for neg_pos in range(gt_position):
-                        neg_idx = top_k[neg_pos]
-                        
-                        if is_real_retrieval:
-                            # Use actual target path
-                            hard_negative_image = target_paths[neg_idx] if neg_idx < len(target_paths) else f"target_{neg_idx}"
-                        else:
-                            # Use simulated index
-                            hard_negative_image = neg_idx
-                        
-                        hard_negatives.append({
-                            'reference_image': query['reference_image'],
-                            'modification_text': query['modification_text'],
-                            'target_image': query['target_image'],  # GT
-                            'hard_negative_image': hard_negative_image,
-                            'rank_position': neg_pos + 1,
-                            'gt_rank': gt_position + 1,
-                            'similarity_score': sims[neg_pos] if neg_pos < len(sims) else 0.0,
-                            'is_real_retrieval': is_real_retrieval
-                        })
+                        if collected_negatives >= max_negatives:
+                            break
+                        if process_negative_candidate(neg_pos, top_k[neg_pos], gt_position):
+                            collected_negatives += 1
             else:
-                # GT not found in top-k, all top results are hard negatives
-                for neg_pos in range(min(3, len(top_k))):
-                    neg_idx = top_k[neg_pos]
-                    
-                    if is_real_retrieval:
-                        hard_negative_image = target_paths[neg_idx] if neg_idx < len(target_paths) else f"target_{neg_idx}"
-                    else:
-                        hard_negative_image = neg_idx
-                    
-                    hard_negatives.append({
-                        'reference_image': query['reference_image'],
-                        'modification_text': query['modification_text'],
-                        'target_image': query['target_image'],  # GT
-                        'hard_negative_image': hard_negative_image,
-                        'rank_position': neg_pos + 1,
-                        'gt_rank': -1,  # GT not found in top-k
-                        'similarity_score': sims[neg_pos] if neg_pos < len(sims) else 0.0,
-                        'is_real_retrieval': is_real_retrieval
-                    })
-        
-        return hard_negatives
-    
-    def _identify_hard_negatives_from_batch(self, batch, model, k=5):
-        """
-        Identify hard negatives from a batch using the provided model
-        This method is called by the iterative trainer
-        """
-        print_rank(f"Identifying hard negatives from batch of {len(batch)} samples using model...")
-        
-        # Run retrieval on the batch
-        try:
-            retrieval_results = self._run_real_retrieval(model, batch)
-        except Exception as e:
-            print_rank(f"Real retrieval failed: {e}, falling back to simplified retrieval")
-            retrieval_results = self._run_simplified_retrieval(batch)
-        
-        # Extract hard negatives from retrieval results
-        hard_negatives = self._identify_hard_negatives(batch, retrieval_results, k=k)
+                # GT not found in top-k, all top results are potential hard negatives
+                for neg_pos in range(min(len(top_k), 10)):  # 检查更多候选
+                    if collected_negatives >= max_negatives:
+                        break
+                    if process_negative_candidate(neg_pos, top_k[neg_pos]):
+                        collected_negatives += 1
+            
+            # # 🔥 如果过滤后没有足够的负样本，尝试从排名更低的候选中选择
+            # if collected_negatives < max_negatives and len(top_k) > max_negatives:
+            #     print_rank(f"Only collected {collected_negatives} valid negatives, trying lower-ranked candidates...")
+            #     for neg_pos in range(max_negatives, min(len(top_k), 20)):
+            #         if collected_negatives >= max_negatives:
+            #             break
+            #         if process_negative_candidate(neg_pos, top_k[neg_pos]):
+            #             collected_negatives += 1
+            
+            # Add filtered results to main list
+            hard_negatives.extend(filtered_hard_negatives)
+            
+            if len(filtered_hard_negatives) > 0:
+                print_rank(f"Query {idx}: Collected {len(filtered_hard_negatives)} valid hard negatives after filtering")
+            else:
+                print_rank(f"Query {idx}: No valid hard negatives found after filtering")
         
         return hard_negatives
     
@@ -1294,8 +1339,12 @@ class IterativeCIRRDataset(Dataset):
                 augmented_samples = []
             
             if augmented_samples:
+                # 过滤掉无效的caption
+                print_rank(f"Filtering loaded augmented samples from {len(augmented_samples)} samples...")
+                augmented_samples = self._filter_valid_augmented_samples(augmented_samples)
+                
                 self.augmented_samples = augmented_samples
-                print_rank(f"Loaded {len(augmented_samples)} existing augmented samples")
+                print_rank(f"Loaded {len(augmented_samples)} valid existing augmented samples")
                 return augmented_samples
         
         if not dist.is_initialized():
@@ -1393,7 +1442,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 等待同步目录创建完成（文件轮询）
         wait_count = 0
-        max_wait_dir = 120  # 2分钟等待目录创建
+        max_wait_dir = 36000  # 10小时等待目录创建
         while not os.path.exists(sync_dir) and wait_count < max_wait_dir:
             time.sleep(1)
             wait_count += 1
@@ -1425,7 +1474,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 等待所有GPU完成（文件轮询）
         print_rank(f"GPU {rank}: Waiting for all GPUs to complete caption generation...")
-        max_wait_time = 3600  # 60分钟最大等待时间（caption生成非常耗时）
+        max_wait_time = 36000  # 10个小时最大等待时间（caption生成非常耗时）
         start_wait = time.time()
         
         while time.time() - start_wait < max_wait_time:
@@ -1465,7 +1514,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 等待目录创建完成（文件轮询）
         wait_count = 0
-        max_wait_temp = 120  # 2分钟等待临时目录创建
+        max_wait_temp = 36000  # 10小时等待临时目录创建
         while not os.path.exists(temp_dir) and wait_count < max_wait_temp:
             time.sleep(1)
             wait_count += 1
@@ -1494,7 +1543,7 @@ class IterativeCIRRDataset(Dataset):
         
         # 文件式同步：等待所有GPU完成文件写入
         print_rank(f"GPU {rank}: Waiting for all GPUs to save their files...")
-        max_file_wait = 600  # 10分钟最大等待时间（文件保存也可能较慢）
+        max_file_wait = 36000  # 10小时最大等待时间（文件保存也可能较慢）
         file_wait_start = time.time()
         
         while time.time() - file_wait_start < max_file_wait:
@@ -1568,9 +1617,13 @@ class IterativeCIRRDataset(Dataset):
                     merged_augmented_samples.extend(gpu_samples)
                     print_rank(f"Merged {len(gpu_samples)} samples from a GPU")
             
+            # 过滤掉无效的caption
+            print_rank(f"Filtering invalid captions from {len(merged_augmented_samples)} samples...")
+            merged_augmented_samples = self._filter_valid_augmented_samples(merged_augmented_samples)
+            
             total_time = time.time() - start_time if 'start_time' in locals() else 0
             print_rank(f"Caption generation completed in {int(total_time//60):02d}:{int(total_time%60):02d}")
-            print_rank(f"Generated {len(merged_augmented_samples)} total augmented samples from {len(hard_negatives)} hard negatives")
+            print_rank(f"Generated {len(merged_augmented_samples)} total valid augmented samples from {len(hard_negatives)} hard negatives")
             
             if total_time > 0:
                 print_rank(f"Average generation rate: {len(merged_augmented_samples)/total_time:.2f} samples/second")
@@ -1583,7 +1636,7 @@ class IterativeCIRRDataset(Dataset):
             self.augmented_samples = merged_augmented_samples
             
             # 确保文件写入完成
-            time.sleep(1)  # 给文件系统一点时间完成写入
+            time.sleep(100)  # 给文件系统一点时间完成写入
         else:
             merged_augmented_samples = []
         
@@ -1607,8 +1660,8 @@ class IterativeCIRRDataset(Dataset):
         print_rank(f"GPU {rank}: Waiting for final augmented samples file...")
         
         final_wait_start = time.time()
-        max_final_wait = 300  # 5分钟最大等待时间（文件合并和写入）
-        
+        max_final_wait = 36000  # 10小时最大等待时间（文件合并和写入）
+
         while time.time() - final_wait_start < max_final_wait:
             if os.path.exists(final_aug_file):
                 print_rank(f"GPU {rank}: ✅ Final augmented samples file is ready")
@@ -1636,8 +1689,13 @@ class IterativeCIRRDataset(Dataset):
                 with open(final_aug_file, 'r') as f:
                     saved_data = json.load(f)
                 final_augmented_samples = saved_data.get('samples', [])
+                
+                # 过滤掉无效的caption
+                print_rank(f"GPU {rank}: Filtering loaded augmented samples from {len(final_augmented_samples)} samples...")
+                final_augmented_samples = self._filter_valid_augmented_samples(final_augmented_samples)
+                
                 self.augmented_samples = final_augmented_samples
-                print_rank(f"GPU {rank}: Successfully loaded {len(final_augmented_samples)} augmented samples from file")
+                print_rank(f"GPU {rank}: Successfully loaded {len(final_augmented_samples)} valid augmented samples from file")
             except Exception as e:
                 print_rank(f"GPU {rank}: Error loading augmented samples from file: {e}")
                 final_augmented_samples = []
@@ -1691,7 +1749,7 @@ class IterativeCIRRDataset(Dataset):
                     foundation_processor, foundation_backbone, device, is_hard_negative=True
                 )
                 
-                if new_mod_text:
+                if new_mod_text and self._is_valid_caption(new_mod_text):
                     augmented_samples.append({
                         'reference_image': hard_neg['reference_image'],
                         'modification_text': new_mod_text,
@@ -1738,7 +1796,12 @@ class IterativeCIRRDataset(Dataset):
                 with open(aug_file, 'r') as f:
                     saved_data = json.load(f)
                 augmented_samples = saved_data.get('samples', [])
-                print_rank(f"Loaded {len(augmented_samples)} existing augmented samples")
+                
+                # 过滤掉无效的caption
+                print_rank(f"Filtering loaded augmented samples from {len(augmented_samples)} samples...")
+                augmented_samples = self._filter_valid_augmented_samples(augmented_samples)
+                
+                print_rank(f"Loaded {len(augmented_samples)} valid existing augmented samples")
                 self.augmented_samples = augmented_samples
                 return augmented_samples
             except Exception as e:
@@ -1790,10 +1853,14 @@ class IterativeCIRRDataset(Dataset):
                 # Skip this batch and continue
                 continue
         
+        # 过滤掉无效的caption
+        print_rank(f"Filtering invalid captions from {len(augmented_samples)} samples...")
+        augmented_samples = self._filter_valid_augmented_samples(augmented_samples)
+        
         self.augmented_samples = augmented_samples
         total_time = time.time() - start_time
         print_rank(f"Caption generation completed in {int(total_time//60):02d}:{int(total_time%60):02d}")
-        print_rank(f"Generated {len(augmented_samples)} augmented samples from {len(hard_negatives)} hard negatives")
+        print_rank(f"Generated {len(augmented_samples)} valid augmented samples from {len(hard_negatives)} hard negatives")
         print_rank(f"Average generation rate: {len(augmented_samples)/total_time:.2f} samples/second")
         
         # Save augmented samples to experiment directory
@@ -1854,7 +1921,7 @@ class IterativeCIRRDataset(Dataset):
             
             # 构建增强样本
             for i, (hard_neg, generated_text) in enumerate(zip(hard_neg_data, generated_texts)):
-                if generated_text:
+                if generated_text and self._is_valid_caption(generated_text):
                     print_rank(f"  - Generated: '{generated_text[:100]}{'...' if len(generated_text) > 100 else ''}'")
                     augmented_samples.append({
                         'reference_image': hard_neg['reference_image'],
@@ -1927,7 +1994,9 @@ class IterativeCIRRDataset(Dataset):
             prompts = []
             for original_text in original_texts:
                 if model_backbone in ['qwen2_vl', 'qwen']:
-                    prompt = self._create_qwen_prompt(original_text, is_hard_negative_context=True)
+                    #将此处的prompt改成原修改文本
+                    # prompt = self._create_qwen_prompt(original_text, is_hard_negative_context=True)
+                    prompt = original_text
                 elif model_backbone in ['llava', 'llava_next']:
                     prompt = self._create_llava_prompt_enhanced(original_text, is_hard_negative_context=True)
                 else:
@@ -2012,7 +2081,8 @@ class IterativeCIRRDataset(Dataset):
             
             # Create prompt based on model type with hard negative context
             if model_backbone in ['qwen2_vl', 'qwen']:
-                prompt = self._create_qwen_prompt(original_text, is_hard_negative_context=is_hard_negative)
+                # 使用原修改文本作为prompt，与批量生成保持一致
+                prompt = original_text
                 inputs = self._prepare_qwen_inputs(ref_image, target_image, prompt, processor, device)
                 return self._generate_with_qwen(inputs, device, foundation_model)
             elif model_backbone in ['llava', 'llava_next']:
@@ -2121,25 +2191,246 @@ ASSISTANT:"""
     
     def _prepare_qwen_inputs(self, ref_image, target_image, prompt, processor, device):
         """Prepare inputs for Qwen2-VL"""
+        modification_text = prompt
         # Qwen2-VL can handle multiple images in conversation
-        conversation = [
-            {
-                "role": "user",
+        system_prompt = """
+        You are a multimodal edit auditor. You receive TWO images (Picture 1 = REFERENCE, Picture 2 = TARGET) and ONE input edit text.
+        Your only goal: minimally rewrite the edit text so it is true in the TARGET image.
+
+        ##Global rules (read carefully)
+        -Image roles: The Picture 1 is REFERENCE (original), the Picture 2 is TARGET (to match).
+        - Grounding:
+            - Absolute requirements use TARGET-only evidence.
+            - Relative requirements compare REFERENCE vs TARGET (e.g., "different breed", "face the other direction", "add/remove/replace/move").
+        - No speculation: If something is blurry/occluded/unreadable, say "uncertain" and do not guess.
+        - One QA per intent: The number of QAs must equal the number of atomic intents, with the same IDs and order (|qa| == |intents|; I1→I1, I2→I2, …).
+        - Polar questions only: QA must be yes/no questions (general questions). Banned words: how, how many, how much, how long, how far, how big, how tall, how wide, what, which, where, when, why, who, whom, whose.
+        - Prefixes for QA:
+            - Absolute: start with In the TARGET image, ...
+            - Relative: start with Comparing REFERENCE and TARGET, ...
+            - Allowed auxiliaries immediately after the prefix: is/are/does/do/has/have/can/was/were/did.
+        - Keep it minimal: Keep the final rewrite concise, grammatical, and directly supported by TARGET evidence.
+
+        ##Output format contract (STRICT — no extra sections, no code fences, no JSON)
+        - Output exactly these 6 sections(stages), in this order, with the exact section headers shown below.
+        - Use ASCII quotes (") in key/value fields. Keep IDs unique (I1, I2, ...).
+        - If any field is not applicable, write uncertain.
+
+        ##Guidelines on determining the response <Response>
+        - Responses include the Generate Captions, Decompose Intents, Generate Polar Questions, Answer Questions via Image Comparison, Local Edits, and Generate Text_new:
+        - Every stage should be included in the response and can not be empty.
+        Generate Captions:
+        Reference: [REFERENCE] ...
+        Target: [TARGET] ...
+
+        Decompose Intents:
+        I1 | span="..." | intent="..." | type=absolute|relative | objects=[...] | note="..."
+        I2 | span="..." | intent="..." | type=absolute|relative | objects=[...] | note="..."
+
+        Generate Polar Questions:
+        I1 | scope=target_only|compare_ref_target | Q="In the TARGET image, ...?"
+        I2 | scope=target_only|compare_ref_target | Q="Comparing REFERENCE and TARGET, ...?"
+
+        Answer Questions via Image Comparison:
+        I1 | A=Yes|No|Uncertain | evidence_target="..." | evidence_ref=""
+        I2 | A=Yes|No|Uncertain | evidence_target="..." | evidence_ref="..."
+
+        Local Edits:
+        I1 | action=keep|rewrite|generalize|delete | before="..." | after="..." | reason="..."
+        I2 | action=keep|rewrite|generalize|delete | before="..." | after="..." | reason="..."
+
+        Generate Text_new:
+        text_new="..."
+        """
+        #---Example 1---
+        fs_input1 = """
+        <Input>
+            "REFERENCE": <image_path>,
+            "TARGET": <image_path>,
+            "Input edit text": "Shows a dog of a different breed of the same fur color standing on a white table."
+            """
+        fs_output1 = """
+        Generate Captions:
+            Reference: [REFERENCE] A short-haired brown dog with a collar sits outdoors on a paved area; tongue out; background is blurred urban/stone texture.
+            Target: [TARGET] A long-haired cream/beige dog lies stretched out on a light-colored tabletop/bench indoors; floppy ears; long fur drapes over the edge.
+
+        Decompose Intents:
+            I1 | span="a dog of a different breed" | intent="target dog breed differs from REFERENCE" | type=relative | objects=["dog","breed_difference"] | note="requires comparing REFERENCE vs TARGET appearance"
+            I2 | span="of the same fur color" | intent="target dog has same fur color as REFERENCE" | type=relative | objects=["dog","fur_color"] | note="color equality is a comparison claim"
+            I3 | span="standing" | intent="the dog should be standing" | type=absolute | objects=["dog","pose"] | note="verify from target only"
+            I4 | span="on a white table" | intent="the dog is on a white table" | type=absolute | objects=["dog","table","table_color=white"] | note="presence+color in target only"
+
+        Generate Polar Questions:
+            I1 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, is the dog in the TARGET a different breed than the dog in the REFERENCE?"
+            I2 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, does the TARGET dog have the same fur color as the REFERENCE dog?"
+            I3 | scope=target_only | Q="In the TARGET image, is the dog standing?"
+            I4 | scope=target_only | Q="In the TARGET image, is the dog on a white table?"
+
+        Answer Questions via Image Comparison:
+            I1 | A=Yes | evidence_target="long hair, floppy ears, different head shape" | evidence_ref="short coat, upright ears"
+            I2 | A=No | evidence_target="fur appears light cream/beige" | evidence_ref="fur appears medium brown"
+            I3 | A=No | evidence_target="body and legs lying on the surface; not upright" | evidence_ref=""
+            I4 | A=No | evidence_target="table surface is light-colored but not clearly white" | evidence_ref=""
+
+        Local Edits:
+            I1 | action=keep | before="a dog of a different breed" | after="a dog of a different breed" | reason="confirmed by comparison"
+            I2 | action=rewrite | before="of the same fur color" | after="with light cream fur" | reason="target color differs from REFERENCE"
+            I3 | action=rewrite | before="standing" | after="lying" | reason="target pose is lying"
+            I4 | action=rewrite | before="on a white table" | after="on a light-colored table" | reason="color not clearly white"
+
+        Generate Text_new:
+            text_new="Shows a dog of a different breed with light cream fur lying on a light-colored table."
+        """
+        #---Example 2---
+        fs_input2 = """
+        <Input>
+            "REFERENCE": <image_path>,
+            "TARGET": <image_path>,
+            "Input edit text": "Smaller dog, no background" 
+        """
+
+        fs_output2 = """
+        Generate Captions:
+            Reference: [REFERENCE] A slender grey dog stands on green grass in a yard. A wooden fence and trees are visible behind it. Full body is shown.
+            Target: [TARGET] A close-up of a white-and-tan spaniel face with long ears. The background is pink like a poster, with white headline text at the top.
+
+        Decompose Intents:
+            I1 | span="Smaller dog" | intent="dog should appear smaller than in the REFERENCE" | type=relative | objects=["dog","size in frame"] | note="relative change of apparent size"
+            I2 | span="no background" | intent="there should be no visible background (plain/transparent)" | type=absolute | objects=["background","emptiness/plain"] | note="absolute requirement about background presence"
+
+        Generate Polar Questions:
+            I1 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, does the dog appear smaller in the TARGET image than in the REFERENCE?"
+            I2 | scope=target_only | Q="In the TARGET image, is there no background visible behind the dog?"
+
+        Answer Questions via Image Comparison:
+            I1 | A=No | evidence_target="the dog is a tight head close-up occupying most of the frame" | evidence_ref="full-body dog occupies a smaller portion of the frame"
+            I2 | A=No | evidence_target="pink poster background with headline text is clearly visible" | evidence_ref=""
+
+        Local Edits:
+            I1 | action=rewrite | before="Smaller dog" | after="dog" | reason="target shows enlarged."
+            I2 | action=rewrite | before="no background" | after="on a pink background with text" | reason="background is pink with headline text"
+
+        Generate Text_new:
+            text_new="dog on a pink background with text"
+        """
+        #---Example 3---
+        fs_input3 = """
+        <Input>
+            "REFERENCE": <image_path>,
+            "TARGET": <image_path>,
+            "Input edit text": "Add two dogs."
+        """
+
+        fs_output3 = """
+        Generate Captions:
+            Reference: [REFERENCE] two white puppies are playing in the snow.
+            Target: [TARGET] Three white dogs are playing on a snowy field.
+
+        Decompose Intents:
+            I1 | span="Add two dogs" | intent="add two dogs" | type=relative | objects=["dog"] | note="relative requirement"
+
+        Generate Polar Questions:
+            I1 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, does the TARGET image have two more dogs than the REFERENCE?"
+
+        Answer Questions via Image Comparison:
+            I1 | A=No | evidence_target="three white dogs are playing on a snowy field" | evidence_ref="two white puppies are playing in the snow"
+
+        Local Edits:
+            I1 | action=rewrite | before="Add two dogs" | after="Add a dog" | reason="target has one more dogs than REFERENCE"
+
+        Generate Text_new:
+            text_new="Add a dog"
+        """
+        input_text=f"""
+        <Input>
+            "REFERENCE": Picture 1,
+            "TARGET": Picture 2,
+            "Input edit text": {modification_text}
+        
+        =====================
+        STAGES (run in order)
+        =====================
+        ##Generate Captions:
+        - You must not refer to the input edit text in this stage.
+        - You must mention their unique features in their own captitons.
+        - Do not reuse sentences across Reference and Target. If a sentence would be identical, rewrite it to include a detail unique to that image, or write "uncertain".
+        - Tag mapping: "Reference" ALWAYS refers to Picture 1; "Target" ALWAYS refers to Picture 2.
+        - Reference: [REFERENCE] only describe the reference image(REFERENCE, Picture 1) in 3-5 literal sentences. Be thorough and accurate; list visible objects, attributes (color/material), counts, spatial relations, and readable text. Do not mention TARGET here. If unreadable, say "uncertain".
+        - Target: [TARGET] only describe the target image(TARGET, Picture 2) in 3-5 literal sentences. Same constraints; do not mention REFERENCE here.
+
+        ##Decompose Intents(only use edit text:{modification_text}):
+        - One line per atomic intent, covering all content-bearing phrases in the input edit text (split by commas/"and/then"/parentheses).
+        - you must only decompose the input edit text, do not refer to any information from the REFERENCE or TARGET.
+        - Format (one per line):
+            I# | span="..." | intent="..." | type=absolute|relative | objects=[... ] | note="one-line reason"
+        - Hints:
+            - Treat parenthetical modifiers as their own intents if they encode states/gestures/poses (e.g., "(fist closed)").
+            - Count words exactly ("a/one/two/…") and keep them in span.
+            - Max 6 intents; if more, merge logically but keep atomicity for verifiable units.
+
+        ##Generate Polar Questions:
+        - Create exactly one yes/no question per intent, same order and same ID.
+        - Format (one per line):
+            I# | scope=target_only|compare_ref_target | Q="...?"
+        - Rules:
+            - If type=absolute → scope=target_only and start with In the TARGET image, ...
+            - If type=relative → scope=compare_ref_target and start with Comparing REFERENCE and TARGET, ...
+            - Use only allowed auxiliaries after the prefix; no wh-words.
+
+        ##Answer Questions via Image Comparison:
+        - Answer each question (same IDs and order) with Yes/No/Uncertain and brief evidence based on the TARGET image(Picture 2).
+        - Carefully consider the visibility of the object in the TARGET image(Picture 2),and only when the evidence is clear, you can answer "Yes".
+        - Format (one per line):
+            I# | A=Yes|No|Uncertain | evidence_target="..." | evidence_ref="..."
+        - every question should be answered, and the answer should be based on the TARGET image only.
+        - Notes:
+            - If scope=target_only, fill evidence_ref="".
+            - If scope=compare_ref_target, you can refer to the REFERENCE image for relative information, but the answer should be based on the TARGET image only.
+            - If visibility is insufficient, choose Uncertain.
+
+        ##Local Edits:
+        - Map each intent to a local edit: Yes → keep, No → rewrite to match TARGET.
+        - Format (one per line):
+            I# | action=keep|rewrite|generalize|delete | before="(original span or clause)" | after="(new fragment)" | reason="(short why)"
+
+        ##Generate Text_new:
+        - Output a single fluent sentence (or two short clauses) by merging all local edits with action=keep or rewrite (skip delete; generalize if you marked generalize).
+        - Format (one per line):
+            text_new="..."
+        - Rules:
+            - Please keep all intents that you answered "Yes" in the local edits.
+            - Use the TARGET image as the evidence source.
+            - do not contain 'REFERENCE' or 'TARGET' in the text_new.
+            - if rewrite, please rewrite it with target image's that feature.(e.g. "four dogs" but in target image only two dogs -> "two dogs")
+            - try to keep the original format of the input edit text.(e.g. "a bird of a yellow color" -> "a bird of blue color")
+        """
+        conversation =[
+            {"role": "system", "content": system_prompt},
+            #---Example 1---
+            {"role": "user", "content": fs_input1},
+            {"role": "assistant", "content": fs_output1},
+            #---Example 2---
+            {"role": "user", "content": fs_input2},
+            {"role": "assistant", "content": fs_output2},
+            #---Example 3---
+            {"role": "user", "content": fs_input3},
+            {"role": "assistant", "content": fs_output3},
+            #---User Prompt--- 
+            {"role": "user",
                 "content": [
                     {"type": "image", "image": ref_image},
                     {"type": "image", "image": target_image},
-                    {"type": "text", "text": prompt}
-                ]
-            }
+                    {"type": "text", "text": input_text}
+                ]}
         ]
         
-        text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+        text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True,add_vision_id=True)
         
         inputs = processor(
             text=[text_prompt],
             images=[ref_image, target_image],
             return_tensors="pt",
-            padding=True
+            padding=True,
         )
         
         return {k: v.to(device) for k, v in inputs.items()}
@@ -2187,6 +2478,68 @@ ASSISTANT:"""
         
         return {k: v.to(device) for k, v in inputs.items()}
     
+    def _output_translator(self, generated_text):
+        """Extract text_new from model output"""
+        import json
+        import re
+        
+        if not generated_text:
+            return None
+        
+        try:
+            # 方法1: 尝试直接解析JSON
+            parsed_json = json.loads(generated_text.strip())
+            if isinstance(parsed_json, dict) and "text_new" in parsed_json:
+                return parsed_json["text_new"]
+        except json.JSONDecodeError:
+            pass
+        
+        try:
+            # 方法2: 尝试匹配```json代码块中的JSON
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', generated_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                parsed_json = json.loads(json_str)
+                if isinstance(parsed_json, dict) and "text_new" in parsed_json:
+                    return parsed_json["text_new"]
+        except json.JSONDecodeError:
+            pass
+        
+        try:
+            # 方法3: 尝试匹配大括号内的JSON内容
+            brace_match = re.search(r'\{[^{}]*"text_new"\s*:\s*"([^"]*)"[^{}]*\}', generated_text, re.DOTALL)
+            if brace_match:
+                return brace_match.group(1)
+        except:
+            pass
+        
+        try:
+            # 方法4: 直接匹配 "text_new": "内容" 格式
+            text_new_match = re.search(r'"text_new"\s*:\s*"([^"]*)"', generated_text)
+            if text_new_match:
+                return text_new_match.group(1)
+        except:
+            pass
+        
+        try:
+            # 方法5: 匹配 text_new="内容" 格式（不带引号的key）
+            text_new_match = re.search(r'text_new\s*[=:]\s*"([^"]*)"', generated_text)
+            if text_new_match:
+                return text_new_match.group(1)
+        except:
+            pass
+        
+        try:
+            # 方法6: 匹配 "Text_new": "内容" 格式（不带引号的key）
+            text_new_match = re.search(r'"Text_new"\s*[:=]\s*"([^"]*)"', generated_text)
+            if text_new_match:
+                return text_new_match.group(1)
+        except:
+            pass
+        
+        # 如果所有方法都失败，返回空字符串
+        return ' '
+    
     def _generate_with_qwen(self, inputs, device, foundation_model):
         """Generate text with Qwen2-VL with memory optimization"""
         try:
@@ -2196,28 +2549,31 @@ ASSISTANT:"""
                 
                 output_ids = foundation_model.generate(
                     **inputs,
-                    max_new_tokens=100,
+                    max_new_tokens=2048,# 增加了最大输出token数
                     do_sample=True,
-                    temperature=0.7,
+                    temperature=0.8,
                     top_p=0.9,
                     pad_token_id=foundation_model.config.eos_token_id
                 )
-                
-                # Decode only the new tokens
+                 
+                #  Decode only the new tokens
                 input_length = inputs['input_ids'].shape[1]
                 generated_ids = output_ids[:, input_length:]
                 
                 generated_text = foundation_model.processor.decode(
                     generated_ids[0], skip_special_tokens=True
                 ).strip()
-                
+                # generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, output_ids)]
+                # generated_text = foundation_model.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+
                 # Clear intermediate results from memory
                 del output_ids, generated_ids
                 torch.cuda.empty_cache()
                 
                 # Post-process the generated text
-                cleaned_text = self._post_process_generated_text(generated_text)
-                
+                # cleaned_text = self._post_process_generated_text(generated_text)
+                #重写新的适配的模型输出解析器。
+                cleaned_text=self._output_translator(generated_text)
                 return cleaned_text
                 
         except torch.cuda.OutOfMemoryError as e:
@@ -2459,7 +2815,9 @@ ASSISTANT:"""
             'pos_image': self._load_image(target_image_path),
             'neg_text': neg_text,
             'neg_image': self._load_image(ref_image_path),  # Use reference as negative for now
-            'global_dataset_name': 'CIRR'
+            'global_dataset_name': 'CIRR',
+            # 🔥 添加 reference_image 路径，供 GroupedBatchSampler 使用
+            'reference_image': ref_image_path
         }
     
     def _get_augmented_sample(self, idx):
@@ -2500,7 +2858,9 @@ ASSISTANT:"""
             'neg_image': self._load_image(sample['reference_image']),  # Use reference as negative
             'global_dataset_name': 'CIRR',
             'is_augmented': True,
-            'original_mod_text': sample['original_mod_text']
+            'original_mod_text': sample['original_mod_text'],
+            # 🔥 添加 reference_image 路径，供 GroupedBatchSampler 使用
+            'reference_image': sample['reference_image']
         }
     
     def _load_image(self, image_path):
@@ -2552,6 +2912,15 @@ ASSISTANT:"""
         try:
             with open(aug_file, 'w') as f:
                 json.dump(summary, f, indent=2)
+
+                # --- 关键修改：强制同步到物理存储 ---
+                # 2. 确保所有Python内部缓冲区的数据都已写入操作系统
+                f.flush()
+                # 3. 强制操作系统将文件的所有缓存数据和元数据立即同步到底层存储设备（例如网络文件服务器）
+                #    这是一个阻塞操作，直到同步完成才会返回。
+                os.fsync(f.fileno())
+                # --- 修改结束 ---
+                
             print_rank(f"Saved {len(augmented_samples)} augmented samples to {aug_file}")
             print_rank(f"Statistics: avg_original_len={summary['sample_statistics']['avg_original_length']:.1f}, "
                       f"avg_generated_len={summary['sample_statistics']['avg_generated_length']:.1f}")
@@ -2610,6 +2979,78 @@ ASSISTANT:"""
                     os.remove(temp_file)
                 except:
                     pass
+
+    def _is_valid_caption(self, caption_text):
+        """
+        检查生成的caption是否有效（非空且有意义）
+        
+        Args:
+            caption_text: 生成的caption文本
+            
+        Returns:
+            bool: True表示有效，False表示无效（应该被过滤掉）
+        """
+        if not caption_text:
+            return False
+        
+        # 去除前后空格
+        caption_text = caption_text.strip()
+        
+        # 检查是否为空或只包含空白字符
+        if not caption_text or caption_text.isspace():
+            return False
+        
+        # 检查是否只是单个空格字符（_output_translator的默认返回值）
+        if caption_text == ' ':
+            return False
+        
+        # 检查长度是否太长
+        if len(caption_text) > 300:
+            return False
+        
+        # 检查是否包含一些无意义的标记或占位符
+        invalid_patterns = [
+            'uncertain',
+            'Generate Captions',
+            'Generate Text_new',
+            'Generate Polar Questions',
+            'Answer Questions via Image Comparison',
+            'Local Edits',
+            'Decompose Intents',
+        ]
+        
+        caption_lower = caption_text.lower()
+        for pattern in invalid_patterns:
+            if caption_lower == pattern or caption_lower.startswith(pattern):
+                return False
+        
+        return True
+    
+    def _filter_valid_augmented_samples(self, augmented_samples):
+        """
+        过滤掉无效caption的增强样本
+        """
+        if not augmented_samples:
+            return []
+        
+        original_count = len(augmented_samples)
+        valid_samples = []
+        
+        for sample in augmented_samples:
+            modification_text = sample.get('modification_text', '')
+            
+            if self._is_valid_caption(modification_text):
+                valid_samples.append(sample)
+            else:
+                # 记录被过滤的样本（用于调试）
+                print_rank(f"Filtered invalid caption: '{modification_text}' (original: '{sample.get('original_mod_text', '')}')") if len(valid_samples) < 5 else None
+        
+        filtered_count = original_count - len(valid_samples)
+        if filtered_count > 0:
+            print_rank(f"Filtered out {filtered_count} samples with invalid captions ({filtered_count/original_count*100:.1f}%)")
+            print_rank(f"Remaining valid samples: {len(valid_samples)}/{original_count}")
+        
+        return valid_samples
 
 
 class IterativeFashionIQDataset(IterativeCIRRDataset):

@@ -14,6 +14,9 @@ from src.model.processor import LLAVA_NEXT, QWEN2_VL, QWEN2_5_VL, \
 from PIL import Image
 import io
 from src.utils import print_rank, print_master
+import os
+import psutil
+from datetime import datetime
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +56,6 @@ def split_vlm_inputs(model_input: dict, chunk_size: int):
 
     # for pixel_values and image_sizes, need to split based on the position of images
     input_ids = arg_val["input_ids"]
-    # positions = torch.nonzero(((input_ids < 0) & (input_ids > -MAX_INPUT_ID)) | input_ids == LLAVE_IMAGE_TOKEN_ID, as_tuple=True)
     positions = torch.nonzero((input_ids < 0) & (input_ids > -PHI_IMAGE_TOKEN_MAX_INPUT_ID), as_tuple=True)
     row_contain_image = torch.unique(positions[0])  # indicates which row in input_ids contain images
     num_chunks = len(chunked_tensors[0])
@@ -127,80 +129,123 @@ class MultimodalDataCollator:
     model_args: ModelArguments
     data_args: DataArguments
     training_args: TrainingArguments
-    batch_size: Optional[int] = None  # used to verify if a batch has invalid data
+    batch_size: Optional[int] = None
+
+    def __post_init__(self):
+        # 统计计数器
+        self.long_text_count = 0
+        self.total_text_count = 0
 
     def _get_batch_inputs(self, batch, text_keyname, image_keyname):
         texts, visual_inputs = [], []
-        for example in batch:
-            # @ruimeng filter invalid data examples here may lead to fail to sync across devices (unequal batch size)
-            # use dummy input for now
+        
+        for batch_idx, example in enumerate(batch):
             if example is None or not example:
                 text, visual_input = '  ', None
             else:
                 text, raw_images = example[text_keyname], example[image_keyname]
+                
+                # 🔥 更积极的文本长度限制 - 专门针对增强数据的长文本问题
+                if text and len(text) > 400:  # 降低到400字符（约100 tokens）
+                    self.long_text_count += 1
+                    original_len = len(text)
+                    text = text[:400]  # 截断到400字符
+                    if self.long_text_count <= 10:  # 增加警告显示数量以便观察
+                        print_rank(f"⚠️  Long text truncated: {original_len} -> {len(text)} chars")
+                
+                self.total_text_count += 1
+                
                 if type(raw_images) == dict:
                     visual_input = []
                     assert 'resolutions' in raw_images, "we need len(raw_images['resolutions']) to determine the number of images, set it a list of None of for cases that no resizing is needed"
                     num_images = len(raw_images['resolutions'])
+                    
                     for image_idx in range(num_images):
-                        bytes = raw_images['bytes'][image_idx] if 'bytes' in raw_images else None
+                        bytes_data = raw_images['bytes'][image_idx] if 'bytes' in raw_images else None
                         path = raw_images['paths'][image_idx] if 'paths' in raw_images else None
                         image_resolution = raw_images['resolutions'][image_idx] if 'resolutions' in raw_images else None
-                        if bytes is None and path is None:
-                            image = None
-                        elif bytes is not None:
-                            # vidore, image inputs are already bytes
-                            image = Image.open(io.BytesIO(bytes))
-                        elif path is not None:
-                            # mmeb/video datasets, lazy image loading and processing
-                            with Image.open(path) as img:
-                                image = img.convert("RGB")
-                        else:
-                            print_rank(f"\n{'=' * 50}\nsomething went wrong with a data point from {example['global_dataset_name']}, neither bytes or path is given. \n\t\tquery_text: {example['query_text']}")
+                        
+                        image = self._load_image(bytes_data, path)
+                        
                         if not self.data_args.resize_use_processor and image is not None and image_resolution:
                             image = image.resize(image_resolution)
+                            
                         if image is not None and (self.data_args.image_decay_factor is not None and image_resolution is None):
                             assert image_resolution is None, "image_resolution is conflicting with image_decay_factor"
                             assert self.model_args.model_backbone in [QWEN2_VL, QWEN2_5_VL, QWEN2_VL_TOKENSELECTION, QWEN2_5_VL_TOKENSELECTION], "image_decay_factor is only supported for Qwen models"
-                            # TODO: this is a hacky way to decay image resolution, need to be refactored
                             max_pixels = max(self.data_args.resize_min_pixels, self.data_args.resize_max_pixels * self.data_args.image_decay_factor ** (num_images - image_idx))
                             width, height = image.size
                             resized_height, resized_width = smart_resize(
-                                height,
-                                width,
+                                height, width,
                                 min_pixels=self.data_args.resize_min_pixels,
                                 max_pixels=max_pixels,
                             )
-                            image = image.resize((resized_width, resized_height))  
+                            image = image.resize((resized_width, resized_height))
+                            
                         visual_input.append(image)
                 else:
-                    visual_input = None
+                    visual_input = None  
             texts.append(text)
             visual_inputs.append(visual_input)
+    
         inputs = {'text': texts, 'images': visual_inputs}
         return inputs
 
+    def _load_image(self, bytes_data, path):
+        """还原原始的简单图像加载逻辑"""
+        try:
+            if bytes_data is None and path is None:
+                return None
+            elif bytes_data is not None:
+                image = Image.open(io.BytesIO(bytes_data))
+                return image.convert("RGB")
+            elif path is not None:
+                with Image.open(path) as img:
+                    return img.convert("RGB")
+        except Exception as e:
+            print_rank(f"❌ Failed to load image: {e}")
+            return None
 
     def __call__(self, examples):
-        """
-        :param examples: 'query_text', 'query_image_path', 'pos_text', 'pos_image_path', 'neg_text', 'neg_image_path'
-        """
-        qry_inputs = self._get_batch_inputs(examples, "query_text", "query_image")
-        pos_inputs = self._get_batch_inputs(examples, "pos_text", "pos_image")
-        neg_inputs = self._get_batch_inputs(examples, "neg_text", "neg_image")
-        bs = len(qry_inputs['text'])
-        assert bs > 0, 'An empty batch'
-        # pad batch to batch_size to avoid hanging in distributed training
-        if self.batch_size is not None and bs < self.batch_size:
-            raise RuntimeError(f"Expect batch size {self.batch_size}, but got batch size of {bs}")
-            pass
-        process_fn = process_vlm_inputs_fns[self.training_args.model_backbone]
-        processed_qry_inputs = process_fn(qry_inputs, processor=self.processor, max_length=self.data_args.max_len)
-        processed_pos_inputs = process_fn(pos_inputs, processor=self.processor, max_length=self.data_args.max_len)
-        processed_qry_inputs['text'] = [e['query_text'] for e in examples]
-        processed_pos_inputs['text'] = [e['pos_text'] for e in examples]
-        processed_qry_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
-        processed_pos_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
+        """保持原有逻辑不变"""
+        try:
+            qry_inputs = self._get_batch_inputs(examples, "query_text", "query_image")
+            pos_inputs = self._get_batch_inputs(examples, "pos_text", "pos_image")
+            neg_inputs = self._get_batch_inputs(examples, "neg_text", "neg_image")
+            
+            bs = len(qry_inputs['text'])
+            assert bs > 0, 'An empty batch'
+            
+            if self.batch_size is not None and bs < self.batch_size:
+                raise RuntimeError(f"Expect batch size {self.batch_size}, but got batch size of {bs}")
+                
+            process_fn = process_vlm_inputs_fns[self.training_args.model_backbone]
+            processed_qry_inputs = process_fn(qry_inputs, processor=self.processor, max_length=self.data_args.max_len)
+            processed_pos_inputs = process_fn(pos_inputs, processor=self.processor, max_length=self.data_args.max_len)
+            
+            processed_qry_inputs['text'] = [e['query_text'] for e in examples]
+            processed_pos_inputs['text'] = [e['pos_text'] for e in examples]
+            processed_qry_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
+            processed_pos_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
 
-        # print_rank(f"\t\tQry collator: processed_qry_inputs['input_ids'].shape={processed_qry_inputs['input_ids'].shape}\t\tPos collator: processed_pos_inputs['input_ids'].shape={processed_pos_inputs['input_ids'].shape}")
-        return processed_qry_inputs, processed_pos_inputs
+            # 🔥 定期报告文本截断统计
+            if self.total_text_count % 1000 == 0:
+                print_rank(f"📊 Text stats - Total: {self.total_text_count}, Truncated: {self.long_text_count} ({self.long_text_count/self.total_text_count*100:.1f}%)")
+                
+            # >>> 新增：透传 sample_ids（用于跨 rank 首批对比）
+            sid_list = []
+            for e in examples:
+                sid = e.get("sample_ids", None)
+                if isinstance(sid, torch.Tensor):
+                    sid_list.append(sid.cpu())
+                elif sid is None:
+                    sid_list.append(torch.tensor(-1))
+                else:
+                    sid_list.append(torch.tensor(int(sid)))
+            processed_qry_inputs["sample_ids"] = torch.stack(sid_list)
+            return processed_qry_inputs, processed_pos_inputs
+            
+        except Exception as e:
+            print_rank(f"❌ Collator error: {e}")
+            print_rank(f"📊 Stats - Total texts: {self.total_text_count}, Truncated: {self.long_text_count}")
+            raise

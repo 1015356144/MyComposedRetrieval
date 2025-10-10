@@ -27,7 +27,8 @@ class IterativeRetrievalTrainer(MMEBTrainer):
     """
     
     def __init__(self, 
-                 foundation_model=None,
+                 foundation_model=None, # 忽略传进来的实例
+                 foundation_model_name: str = None,     # 只保存名字
                  max_iterations: int = 3,
                  hard_neg_collection_freq: int = 1,
                  caption_generation_batch_size: int = 8,
@@ -39,10 +40,10 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                  fast_mode_max_samples: int = 100,
                  fast_mode_retrieval_db_size: int = 50,
                  fast_mode_max_steps: int = 5,
-                 steps_per_iteration: int = 1000,  # 新参数名：每轮迭代的步数
+                 steps_per_iteration: int = 1000,  # New parameter: steps per iteration
                  production_save_steps: int = 100,
-                 # 保持向后兼容性
-                 production_max_steps: Optional[int] = None,  # 旧参数名，用于向后兼容
+                 # Backward compatibility
+                 production_max_steps: Optional[int] = None,  # Old parameter name for compatibility
                  **kwargs):
         # Store model_args, data_args and max_length before calling super().__init__()
         self.model_args = model_args
@@ -51,11 +52,11 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         
         # Handle parameter compatibility: steps_per_iteration vs production_max_steps
         if production_max_steps is not None:
-            # 向后兼容：如果传入了旧参数名，使用它并发出警告
+            # Backward compatibility: use old parameter name and issue warning
             print_master("⚠️  WARNING: 'production_max_steps' is deprecated, use 'steps_per_iteration' instead")
             self.production_max_steps = production_max_steps
         else:
-            # 使用新参数名
+            # Use new parameter name
             self.production_max_steps = steps_per_iteration
         
         # Store fast mode and production mode settings
@@ -63,18 +64,19 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         self.fast_mode_max_samples = fast_mode_max_samples
         self.fast_mode_retrieval_db_size = fast_mode_retrieval_db_size
         self.fast_mode_max_steps = fast_mode_max_steps
-        # self.production_max_steps 已经在上面设置了
+        # self.production_max_steps already set above
         self.production_save_steps = production_save_steps
         
-        # 🔧 计算迭代训练的步数规划
+        # Calculate iterative training step planning
         if self.fast_mode:
             self.steps_per_iteration = self.fast_mode_max_steps
         else:
             self.steps_per_iteration = self.production_max_steps
         
-        # 关键：计算总的训练步数用于学习率调度器
-        self.total_planned_steps = max_iterations * self.steps_per_iteration
-        print_master(f"📋 Training plan: {max_iterations} iterations × {self.steps_per_iteration} steps = {self.total_planned_steps} total steps")
+        # New strategy: independent training per iteration, no global training plan
+        # Removed total_planned_steps concept, each iteration resets optimizer and scheduler
+        print_master(f"📋 Training plan: {max_iterations} iterations × {self.steps_per_iteration} steps per iteration")
+        print_master("🔄 Strategy: Each iteration will reset optimizer and LR scheduler for independent training")
         
         # Remove parameters that parent Trainer doesn't accept
         kwargs.pop('model_args', None)
@@ -84,13 +86,16 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         kwargs.pop('fast_mode_max_samples', None)
         kwargs.pop('fast_mode_retrieval_db_size', None)
         kwargs.pop('fast_mode_max_steps', None)
-        kwargs.pop('steps_per_iteration', None)  # 新参数名
-        kwargs.pop('production_max_steps', None)  # 旧参数名，向后兼容
+        kwargs.pop('steps_per_iteration', None)  # New parameter name
+        kwargs.pop('production_max_steps', None)  # Old parameter name, backward compatibility
         kwargs.pop('production_save_steps', None)
         
         super().__init__(**kwargs)
         
-        self.foundation_model = foundation_model
+        self.foundation_model = None
+        self.foundation_processor = None
+        self.foundation_model_name = foundation_model_name
+
         self.max_iterations = max_iterations
         self.hard_neg_collection_freq = hard_neg_collection_freq
         self.caption_generation_batch_size = caption_generation_batch_size
@@ -117,6 +122,60 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         # Apply fast mode or production mode settings
         self._configure_training_mode()
     
+    def _lazy_load_foundation_model(self, to_device: str = None):
+        """
+        在本 rank 需要生成 caption 时才加载一次 FM；避免训练阶段显存占用。
+        """
+        if getattr(self, "foundation_model", None) is not None:
+            # 已加载；必要时挪到目标设备
+            if to_device:
+                try:
+                    self.foundation_model.to(to_device)
+                except Exception:
+                    pass
+            return self.foundation_model
+
+        if not self.foundation_model_name:
+            print_master("No foundation_model_name set; skip loading FM.")
+            return None
+
+        import torch
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+        dev = to_device or (f"cuda:{self.args.process_index}" if torch.cuda.is_available() else "cpu")
+
+        print_master(f"🔁 Lazy-loading foundation model on {dev}: {self.foundation_model_name}")
+        fm = AutoModelForVision2Seq.from_pretrained(
+            self.foundation_model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map=None
+        ).to(dev).eval()
+
+        proc = AutoProcessor.from_pretrained(self.foundation_model_name, trust_remote_code=True)
+        setattr(fm, "processor", proc)      # 让 dataset 能通过 foundation_model.processor 访问
+        self.foundation_model = fm
+        self.foundation_processor = proc
+        print_master("✅ Foundation model lazy-loaded.")
+        return fm
+
+    def _unload_foundation_model(self):
+        """生成结束后立刻卸载，释放显存。"""
+        import gc, torch
+        try:
+            del self.foundation_model
+        except Exception:
+            pass
+        self.foundation_model = None
+        try:
+            del self.foundation_processor
+        except Exception:
+            pass
+        self.foundation_processor = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print_master("🧹 Foundation model unloaded and CUDA cache cleared.")
+
     def _configure_logging(self):
         """Configure additional logging to ensure train.log is generated"""
         if hasattr(self.args, 'logging_dir') and self.args.logging_dir:
@@ -161,7 +220,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             print_master(f"Max samples for hard negatives: {self.fast_mode_max_samples}")
             print_master(f"Retrieval database size: {self.fast_mode_retrieval_db_size}")
             
-            # 配置保存和日志频率
+            # Configure save and logging frequency
             self.args.save_steps = max(1, self.steps_per_iteration // 2)  # Save in the middle
             self.args.logging_steps = 1
             
@@ -170,18 +229,15 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             print_master(f"Steps per iteration: {self.steps_per_iteration}")
             print_master(f"Save frequency: every {self.production_save_steps} steps")
             
-            # 配置保存和日志频率
+            # Configure save and logging frequency
             self.args.save_steps = self.production_save_steps
             self.args.logging_steps = min(10, self.production_save_steps // 10)
         
-        # 🔧 关键修改：使用总的计划步数初始化学习率调度器
-        # 这确保了调度器从一开始就知道整个训练的"蓝图"
-        print_master(f"🎯 Setting max_steps for LR scheduler: {self.total_planned_steps}")
-        print_master(f"   ➡️ LR scheduler will plan decay over full {self.max_iterations} iterations")
-        self.args.max_steps = self.total_planned_steps
+        # New strategy: no longer set global max_steps, each iteration decides independently
+        # Each iteration will temporarily set self.args.max_steps = self.steps_per_iteration
+        print_master("🎯 Each iteration will train independently with fresh optimizer/scheduler")
         
         print_master(f"Final training configuration:")
-        print_master(f"  total_planned_steps: {self.total_planned_steps}")
         print_master(f"  steps_per_iteration: {self.steps_per_iteration}")
         print_master(f"  save_steps: {self.args.save_steps}")
         print_master(f"  logging_steps: {self.args.logging_steps}")
@@ -353,11 +409,10 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     print_master(f"Iteration {iteration}: Training with augmented data...")
                     self._train_current_iteration()
                     
-                    # 🔧 验证训练状态连续性（在checkpoint加载后）
-                    if not self._verify_training_state_continuity():
-                        print_master("‼️ Training state verification failed - but training completed successfully")
+                    # Verify training completion status (no longer verify continuity since we reset state)
+                    print_master(f"✅ Iteration {iteration} training completed with fresh optimizer/scheduler")
                 
-                # 添加同步屏障：确保所有GPU完成训练
+                # Add sync barrier: ensure all GPUs complete training
                 if dist.is_initialized():
                     dist.barrier()
                     print_master(f"All GPUs completed training for iteration {iteration}")
@@ -392,7 +447,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     hard_neg_time = time.time() - hard_neg_start_time
                     print_master(f"Hard negative collection completed in {int(hard_neg_time//60):02d}:{int(hard_neg_time%60):02d}")
                     
-                    # 添加同步屏障：确保所有GPU完成硬负样本收集
+                    # Add sync barrier: ensure all GPUs complete hard negative collection
                     if dist.is_initialized():
                         dist.barrier()
                         print_master(f"All GPUs completed hard negative collection for iteration {iteration}")
@@ -415,7 +470,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                         caption_time = time.time() - caption_start_time
                         print_master(f"Caption generation completed in {int(caption_time//60):02d}:{int(caption_time%60):02d}")
                         
-                        # 添加同步屏障：确保所有GPU完成caption生成
+                        # Add sync barrier: ensure all GPUs complete caption generation
                         if dist.is_initialized():
                             dist.barrier()
                             print_master(f"All GPUs completed caption generation for iteration {iteration}")
@@ -431,7 +486,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                         augmented_samples = saved_data.get('samples', [])
                         caption_time = 0  # No time spent since cached
                     
-                    # 性能统计
+                    # Performance statistics
                     total_time = hard_neg_time + caption_time
                     print_master(f"📊 Iteration {iteration} data preparation stats:")
                     print_master(f"  - Hard negatives: {len(hard_negatives)} samples in {hard_neg_time:.1f}s")
@@ -447,12 +502,12 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     print_master("No hard negatives found, stopping early")
                     break
             
-            # 🔧 CRITICAL FIX: 同步屏障确保所有GPU完成当前迭代后再保存状态
+            # CRITICAL FIX: Sync barrier ensure all GPUs complete current iteration before saving state
             if dist.is_initialized():
                 dist.barrier()
                 print_master(f"All GPUs completed iteration {iteration}, saving state...")
             
-            # Save iteration checkpoint (只有rank 0写入)
+            # Save iteration checkpoint (only rank 0 writes)
             self._save_iteration_state(iteration)
         
         print_master("\nIterative training completed!")
@@ -460,34 +515,39 @@ class IterativeRetrievalTrainer(MMEBTrainer):
     
     def _train_base_model(self):
         """Train the base retrieval model using standard contrastive learning"""
-        print_master("Training base model with original dataset...")
+        print_master("Training base model with original dataset and fresh optimizer...")
         
         # Use original dataset
         self.train_dataset = self.original_dataset
         self._update_train_dataloader()
         
-        # 🔧 临时覆盖机制：为本次迭代设置停止点
-        original_max_steps = self.args.max_steps  # 保存总的计划步数
-        iteration_stop_point = self.steps_per_iteration
+        # Create independent subdirectory for base model training to avoid checkpoint conflicts
+        original_output_dir = self.args.output_dir      # Save main output directory
+        original_max_steps = self.args.max_steps        # Save original value
+        base_training_dir = os.path.join(original_output_dir, "training_iter_0")
         
-        print_master(f"🎯 Base model training plan:")
-        print_master(f"   - This iteration: 0 → {iteration_stop_point} steps")
-        print_master(f"   - Total planned: {original_max_steps} steps")
-        print_master(f"   - LR scheduler knows about all {original_max_steps} steps")
+        # Create base model specific training directory
+        os.makedirs(base_training_dir, exist_ok=True)
+        self.args.output_dir = base_training_dir         # Temporarily change to subdirectory
+        self.args.max_steps = self.steps_per_iteration   # Set for current iteration steps
         
-        # 临时设置为本次迭代的停止点
-        self.args.max_steps = iteration_stop_point
-        
+        print_master(f"🎯 Base model training plan: 0 → {self.args.max_steps} steps")
+        print_master(f"🆕 Starting fresh training with new optimizer and scheduler")
+        print_master(f"📁 Training checkpoints will be saved to: {base_training_dir}")
+        print_master(f"📁 Final base model will be saved to: {original_output_dir}")
+
         try:
-            # Standard training - HuggingFace Trainer处理一切
+            # resume_from_checkpoint=None ensures new optimizer and scheduler creation
             train_result = self.train(resume_from_checkpoint=None)
         finally:
-            # 🔧 关键：无论成功还是失败，都要恢复原始的总步数
+            # Restore original output directory and max_steps
+            self.args.output_dir = original_output_dir
             self.args.max_steps = original_max_steps
-            print_master(f"✅ Restored max_steps to total planned: {original_max_steps}")
+            print_master(f"✅ Restored output_dir to: {original_output_dir}")
+            print_master(f"✅ Restored max_steps to: {original_max_steps}")
         
-        # Save base model
-        base_model_path = os.path.join(self.args.output_dir, "base_model")
+        # Save base model to main directory (not subdirectory)
+        base_model_path = os.path.join(original_output_dir, "base_model")
         self.save_model(base_model_path)
         
         print_master(f"Base model training completed: 0 → {self.state.global_step} steps")
@@ -496,52 +556,62 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         return train_result
     
     def _train_current_iteration(self):
-        """Train model for current iteration with augmented data"""
-        print_master(f"Training iteration {self.current_iteration} model...")
+        """
+        Train for the current iteration by loading previous model weights 
+        but resetting the optimizer and LR scheduler for independent training.
+        """
+        print_master(f"Training iteration {self.current_iteration} with RESET optimizer and scheduler...")
         
-        # 确保训练器使用最新的数据集
+        # 1. Important note: model weights already loaded correctly in main() function
+        # trainer only handles training flow control, separation of responsibilities architecture
+        print_master("🧠 Model weights already loaded by main() function")
+        print_master("🔄 Will reset optimizer and scheduler for independent learning rate schedule")
+        
+        # 2. Ensure dataset updated to current iteration state
         self._update_train_dataloader()
         
-        # 🔧 临时覆盖机制：计算本次迭代的停止点
-        current_global_step = getattr(self.state, 'global_step', 0)
-        iteration_stop_point = current_global_step + self.steps_per_iteration
-        original_max_steps = self.args.max_steps  # 保存总的计划步数
+        # 3. Key: create independent subdirectory for each iteration training to avoid checkpoint conflicts
+        original_output_dir = self.args.output_dir  # Save main output directory
+        original_max_steps = self.args.max_steps    # Save original max_steps
+        iteration_output_dir = os.path.join(original_output_dir, f"training_iter_{self.current_iteration}")
         
-        print_master(f"🎯 Iteration {self.current_iteration} training plan:")
-        print_master(f"   - Current step: {current_global_step}")
-        print_master(f"   - This iteration: {current_global_step} → {iteration_stop_point} steps")
-        print_master(f"   - Total planned: {original_max_steps} steps")
-        print_master(f"   - LR scheduler progress: {current_global_step}/{original_max_steps} ({current_global_step/original_max_steps*100:.1f}%)")
+        # Create iteration specific training directory
+        os.makedirs(iteration_output_dir, exist_ok=True)
+        self.args.output_dir = iteration_output_dir        # Temporarily change to subdirectory
+        self.args.max_steps = self.steps_per_iteration     # Set independent steps for this iteration
         
-        # ❗️ 找到最新的检查点
-        from transformers.trainer_utils import get_last_checkpoint
-        latest_checkpoint = get_last_checkpoint(self.args.output_dir)
-        
-        if latest_checkpoint is None and self.current_iteration > 0:
-            print_master("‼️ CRITICAL WARNING: No checkpoint found to resume from for iterative training!")
-            print_master("‼️ This will cause optimizer/scheduler state reset and performance degradation!")
-        elif latest_checkpoint:
-            print_master(f"🔄 Resuming from checkpoint: {latest_checkpoint}")
-            print_master("✅ This will preserve optimizer, scheduler, and global_step state")
-        else:
-            print_master("🆕 Starting fresh training (iteration 0)")
-        
-        # 临时设置为本次迭代的停止点
-        self.args.max_steps = iteration_stop_point
-        
+        print_master(f"🎯 Iteration {self.current_iteration} independent training plan:")
+        print_master(f"   - Will train for {self.args.max_steps} fresh steps")
+        print_master(f"   - Training checkpoints will be saved to: {iteration_output_dir}")
+        print_master(f"   - Final iteration model will be saved to: {original_output_dir}")
+        print_master(f"   - Previous global_step will be ignored for LR scheduling")
+        print_master(f"   - New optimizer and scheduler will start from scratch")
+
         try:
-            # 显式地从最新检查点恢复，这将加载模型、优化器、调度器和训练状态
-            train_result = self.train(resume_from_checkpoint=latest_checkpoint)
+            # 4. Important note: model weights already loaded in main() function
+            # trainer only handles training flow control, no longer handle model weight loading
+            print_master("✅ Model weights already loaded in main(), ready for independent training")
+            print_master("🔄 Creating fresh optimizer and scheduler for this iteration")
+            
+            # 5. Key: call train without resume_from_checkpoint
+            # This forces Trainer to create fresh optimizer and learning rate scheduler
+            # New scheduler will complete entire learning rate decay within self.steps_per_iteration steps
+            train_result = self.train(resume_from_checkpoint=None)
+            
         finally:
-            # 🔧 关键：无论成功还是失败，都要恢复原始的总步数
+            # Key: restore original output directory and max_steps
+            self.args.output_dir = original_output_dir
             self.args.max_steps = original_max_steps
-            print_master(f"✅ Restored max_steps to total planned: {original_max_steps}")
+            print_master(f"✅ Restored output_dir to: {original_output_dir}")
+            print_master(f"✅ Restored max_steps to: {original_max_steps}")
         
-        print_master(f"Training completed: {current_global_step} → {self.state.global_step} steps")
+        print_master(f"Iteration {self.current_iteration} independent training completed")
+        print_master(f"Final step count: {self.state.global_step}")
         
-        # Save iteration model
-        iter_model_path = os.path.join(self.args.output_dir, f"iteration_{self.current_iteration}")
+        # Save final iteration model to main directory (not subdirectory)
+        iter_model_path = os.path.join(original_output_dir, f"iteration_{self.current_iteration}")
         self.save_model(iter_model_path)
+        print_master(f"✅ Final iteration model saved to: {iter_model_path}")
         
         return train_result
     
@@ -554,7 +624,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         # Force recreation of dataloader with updated dataset
         self.get_train_dataloader()
         
-        # 获取数据集的详细信息用于更准确的日志记录
+        # Get detailed dataset information for more accurate logging
         total_samples = len(self.train_dataset)
         if hasattr(self.train_dataset, 'augmented_samples'):
             augmented_count = len(self.train_dataset.augmented_samples)
@@ -565,37 +635,6 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             print_master(f"  - Augmented samples: {augmented_count}")
         else:
             print_master(f"🔄 Updated train dataloader with {total_samples} total samples")
-    
-    def _verify_training_state_continuity(self):
-        """Verify that training state is properly maintained across iterations"""
-        if not hasattr(self, 'state') or self.state is None:
-            print_master("⚠️ WARNING: Trainer state is None - this indicates a problem")
-            return False
-        
-        global_step = getattr(self.state, 'global_step', 0)
-        
-        # For iterations > 0, we should have some training progress
-        if self.current_iteration > 0 and global_step == 0:
-            print_master("‼️ CRITICAL: global_step is 0 in iteration > 0 - training state was reset!")
-            return False
-        
-        # Check if we have optimizer state
-        from transformers.trainer_utils import get_last_checkpoint
-        latest_checkpoint = get_last_checkpoint(self.args.output_dir)
-        if latest_checkpoint and self.current_iteration > 0:
-            import os
-            optimizer_file = os.path.join(latest_checkpoint, "optimizer.pt")
-            scheduler_file = os.path.join(latest_checkpoint, "scheduler.pt")
-            
-            if not os.path.exists(optimizer_file):
-                print_master("‼️ CRITICAL: optimizer.pt not found in latest checkpoint!")
-                return False
-            if not os.path.exists(scheduler_file):
-                print_master("‼️ CRITICAL: scheduler.pt not found in latest checkpoint!")
-                return False
-        
-        print_master(f"✅ Training state verification passed: global_step={global_step}")
-        return True
     
     def _evaluate_current_model(self) -> Dict[str, float]:
         """Evaluate current model on validation set with optimizations and caching"""
@@ -691,7 +730,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     'iteration': self.current_iteration
                 }
         
-        # Save evaluation results to cache for future use (只有主进程写入)
+        # Save evaluation results to cache for future use (only main process writes)
         if not dist.is_initialized() or dist.get_rank() == 0:
             eval_results_file = os.path.join(self.args.output_dir, f"eval_results_iter_{self.current_iteration}.json")
             try:
@@ -728,7 +767,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             if self.fast_mode and hasattr(self.train_dataset, 'fast_mode_retrieval_db_size'):
                 self.train_dataset.fast_mode_retrieval_db_size = self.fast_mode_retrieval_db_size
             
-            # 使用分布式硬负样本收集
+            # Use distributed hard negative collection
             if dist.is_initialized() and dist.get_world_size() > 1:
                 print_master("Using distributed hard negative collection...")
                 hard_negatives = self.train_dataset.collect_hard_negatives_batch_distributed(
@@ -782,30 +821,53 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         return dummy_negatives
     
     def _generate_augmented_captions(self, hard_negatives: List[Dict]) -> List[Dict]:
-        """Generate augmented captions using foundation model"""
-        if not self.foundation_model:
-            print_master("No foundation model available, skipping caption generation")
+        """Generate augmented captions using foundation model (lazy load & unload)."""
+        import torch, torch.distributed as dist
+
+        dev = f"cuda:{self.args.process_index}" if torch.cuda.is_available() else "cpu"
+        fm = self._lazy_load_foundation_model(to_device=dev)
+        if fm is None:
+            print_master("No foundation model available, skip caption generation")
             return []
-        
+
         print_master(f"Generating augmented captions for {len(hard_negatives)} samples...")
-        
-        if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
-            # Ensure dataset has foundation model
-            if not self.train_dataset.foundation_model:
-                print_master("Setting foundation model for dataset...")
-                self.train_dataset.foundation_model = self.foundation_model
-            
-            # 使用分布式caption生成
-            if dist.is_initialized() and dist.get_world_size() > 1:
-                print_master("Using distributed caption generation...")
-                augmented_samples = self.train_dataset.generate_augmented_captions_distributed(hard_negatives)
-            else:
-                print_master("Using single-GPU caption generation...")
-                augmented_samples = self.train_dataset.generate_augmented_captions(hard_negatives)
-        else:
-            # Fallback: implement caption generation here
-            augmented_samples = self._generate_captions_fallback(hard_negatives)
-        
+        augmented_samples: List[Dict] = []
+
+        # 仅支持这两类迭代数据集
+        if not isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
+            print_master("Train dataset is not iterative CIRR/FashionIQ, skip caption generation")
+            self._unload_foundation_model()
+            return augmented_samples
+
+        # 把 FM 和必要配置挂到 dataset
+        if hasattr(self.train_dataset, "foundation_model"):
+            self.train_dataset.foundation_model = fm
+        # 将 caption 批大小传给 dataset（若其方法内会使用）
+        if hasattr(self, "caption_generation_batch_size"):
+            setattr(self.train_dataset, "caption_generation_batch_size", self.caption_generation_batch_size)
+
+        # 缺省指定 backbone 一次（仅当缺失时）
+        if hasattr(self.train_dataset, "model_args") and not getattr(self.train_dataset.model_args, "foundation_model_backbone", None):
+            setattr(self.train_dataset.model_args, "foundation_model_backbone", "qwen2_vl")
+
+        try:
+            with torch.inference_mode():
+                # 分布式优先走分布式接口
+                if dist.is_initialized() and dist.get_world_size() > 1 and hasattr(self.train_dataset, "generate_augmented_captions_distributed"):
+                    print_master("Using distributed caption generation...")
+                    augmented_samples = self.train_dataset.generate_augmented_captions_distributed(hard_negatives)
+                else:
+                    print_master("Using single-GPU caption generation...")
+                    augmented_samples = self.train_dataset.generate_augmented_captions(hard_negatives)
+        except Exception as e:
+            print_master(f"Caption generation failed: {e}")
+            augmented_samples = []
+        finally:
+            # 用完立刻卸载，释放显存，并清理 dataset 引用避免悬挂
+            self._unload_foundation_model()
+            if hasattr(self.train_dataset, "foundation_model"):
+                self.train_dataset.foundation_model = None
+
         print_master(f"Generated {len(augmented_samples)} augmented samples")
         return augmented_samples
     
@@ -832,7 +894,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             "samples": augmented_samples
         }
         
-        # Save augmented samples to file (只有主进程写入)
+        # Save augmented samples to file (only main process writes)
         if not dist.is_initialized() or dist.get_rank() == 0:
             with open(augmented_file, 'w') as f:
                 json.dump(augmented_data, f, indent=2)
@@ -840,13 +902,13 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         else:
             print_rank(f"GPU {dist.get_rank()}: Skipping augmented samples save (only rank 0 writes)")
         
-        # 同步屏障：确保所有GPU都能看到保存的文件
+        # Sync barrier: ensure all GPUs can see the saved file
         if dist.is_initialized():
             dist.barrier()
             print_master("All GPUs synchronized after augmented samples save")
         
         if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
-            # 记录数据集更新前的状态
+            # Record dataset state before update
             old_dataset_len = len(self.train_dataset)
             old_augmented_len = len(self.train_dataset.augmented_samples)
             
@@ -854,7 +916,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             self.train_dataset.iteration_round = next_iteration
             self.train_dataset.augmented_samples.extend(augmented_samples)
             
-            # 记录数据集更新后的状态
+            # Record dataset state after update
             new_dataset_len = len(self.train_dataset)
             new_augmented_len = len(self.train_dataset.augmented_samples)
             
@@ -863,7 +925,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 self.args.output_dir, f"hard_negatives_iter_{next_iteration}.json"
             )
             
-            # 更准确的日志记录
+            # More accurate logging
             print_master(f"📊 Dataset update summary:")
             print_master(f"  - Added {len(augmented_samples)} new augmented samples")
             print_master(f"  - Total augmented samples: {old_augmented_len} → {new_augmented_len}")
@@ -872,7 +934,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         else:
             # Create new iterative dataset
             dataset_config = {
-                'dataset_name': 'composed_retrieval',
+                'dataset_name': 'composed_retrieval',# Save augmented samp
                 'iteration_round': next_iteration
             }
             
@@ -898,7 +960,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     **dataset_config
                 )
         
-        # 重要：强制更新训练器的dataloader以反映数据集变化
+        # Important: force update trainer's dataloader to reflect dataset changes
         self._update_train_dataloader()
         print_master(f"Training dataloader updated for iteration {next_iteration}")
     
@@ -960,7 +1022,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         all_augmented_samples = []
         
         # Load augmented samples from all previous iterations
-        for i in range(1, iteration):
+        for i in range(1, iteration+1):
             augmented_file = os.path.join(self.args.output_dir, f"augmented_samples_iter_{i}.json")
             if os.path.exists(augmented_file):
                 with open(augmented_file, 'r') as f:
@@ -994,7 +1056,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
     
     def _save_iteration_state(self, iteration: int):
         """Save iteration state and metrics with step completion tracking"""
-        # 🔧 CRITICAL FIX: 只有主进程（rank 0）写入状态文件，避免竞争条件
+        # CRITICAL FIX: only main process (rank 0) writes state file to avoid race conditions
         if dist.is_initialized() and dist.get_rank() != 0:
             print_rank(f"GPU {dist.get_rank()}: Skipping state save (only rank 0 writes)")
             return
@@ -1096,14 +1158,15 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         
         # Find best iteration
         if self.iteration_metrics:
-            best_iteration = max(self.iteration_metrics.keys(), 
-                               key=lambda x: self.iteration_metrics[x].get('r_at_1', 0))
+            def _score(m):  # 兼容不同命名
+               return m.get('recall_at_1', m.get('r_at_1', 0))
+            best_iteration = max(self.iteration_metrics.keys(), key=lambda x: _score(self.iteration_metrics[x]))
             best_metrics = self.iteration_metrics[best_iteration]
             
             print_master(f"\nBest performance: Iteration {best_iteration}")
             print_master(f"Best metrics: {best_metrics}")
         
-        # Save summary (只有主进程写入)
+        # Save summary (only main process writes)
         if not dist.is_initialized() or dist.get_rank() == 0:
             summary_file = os.path.join(self.args.output_dir, "training_summary.json")
             summary = {
@@ -1142,7 +1205,7 @@ def create_iterative_trainer(
     fast_mode_params = {}
     for key in ['fast_mode', 'fast_mode_max_samples', 'fast_mode_retrieval_db_size', 
                 'fast_mode_max_steps', 'steps_per_iteration', 'production_save_steps',
-                'production_max_steps']:  # 保持向后兼容
+                'production_max_steps']:  # Keep backward compatibility
         if key in kwargs:
             fast_mode_params[key] = kwargs.pop(key)
     
@@ -1172,11 +1235,15 @@ def create_iterative_trainer(
         if key in kwargs:
             important_args[key] = kwargs.pop(key)
     
+    # NEW: pull foundation_model_name from kwargs (if provided)
+    foundation_model_name = kwargs.pop('foundation_model_name', None)
+
     # Remaining kwargs are ignored
     
     return IterativeRetrievalTrainer(
         model=model,
         foundation_model=foundation_model,
+        foundation_model_name=foundation_model_name,
         args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

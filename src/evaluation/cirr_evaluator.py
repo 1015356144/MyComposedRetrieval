@@ -392,15 +392,21 @@ class CIRREvaluator:
             # Step 1: Distributed candidate image encoding
             print_master(f"Rank {rank}: Starting distributed candidate image encoding...")
             candidate_embeddings = self._encode_images_distributed()
+            # Move to GPU for similarity computation
+            candidate_embeddings = candidate_embeddings.to(self.device)
             candidate_embeddings = F.normalize(candidate_embeddings, p=2, dim=1)
             
             # Step 2: Distributed query encoding  
             print_master(f"Rank {rank}: Starting distributed query encoding...")
             query_embeddings = self._encode_queries_distributed()
+            # Move to GPU for similarity computation
+            query_embeddings = query_embeddings.to(self.device)
             query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
             
             # Step 3: Compute similarities (all ranks have full embeddings now)
+            # 这里所有进程都计算了一遍相似度，但是目前来看计算相似度的开销相对较小，所以暂时不优化
             print_master(f"Rank {rank}: Computing similarities...")
+            print_master(f"Rank {rank}: Query embeddings shape: {query_embeddings.shape}, Candidate embeddings shape: {candidate_embeddings.shape}")
             similarities = torch.mm(query_embeddings, candidate_embeddings.t())
             
             # Step 4: Only rank 0 computes final metrics
@@ -427,7 +433,7 @@ class CIRREvaluator:
     
     def _encode_images_distributed(self) -> torch.Tensor:
         """
-        Distributed encoding of candidate images
+        Distributed encoding of candidate images with improved efficiency
         Each GPU processes a subset of images, then all embeddings are gathered
         """
         import torch.distributed as dist
@@ -435,60 +441,71 @@ class CIRREvaluator:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         
-        # Split candidate images across GPUs
+        # Ensure data is evenly divisible (pad if necessary)
         total_images = len(self.candidate_images)
         images_per_gpu = (total_images + world_size - 1) // world_size
-        start_idx = rank * images_per_gpu
-        end_idx = min(start_idx + images_per_gpu, total_images)
+        padded_total = images_per_gpu * world_size
         
-        local_images = self.candidate_images[start_idx:end_idx]
+        # Pad candidate images if necessary for even distribution
+        if padded_total > total_images:
+            padding_needed = padded_total - total_images
+            # Repeat from beginning to pad
+            padding_images = self.candidate_images[:padding_needed]
+            candidate_images_padded = self.candidate_images + padding_images
+            print_master(f"Padded candidate images: {total_images} -> {padded_total}")
+        else:
+            candidate_images_padded = self.candidate_images
+        
+        # Split evenly across GPUs
+        start_idx = rank * images_per_gpu
+        end_idx = start_idx + images_per_gpu
+        
+        local_images = candidate_images_padded[start_idx:end_idx]
         print_master(f"Rank {rank}: Encoding candidate images {start_idx}-{end_idx-1} ({len(local_images)} images)")
         
-        # Encode local subset of candidate images
+        # Encode local subset with mixed precision
         if len(local_images) > 0:
-            local_embeddings = self._encode_images_local(local_images)
+            with torch.autocast(enabled=True, dtype=torch.bfloat16, device_type="cuda"):
+                local_embeddings = self._encode_images_local(local_images)
+            # Move to CPU to avoid GPU memory issues during gathering
+            local_embeddings = local_embeddings.cpu()
         else:
-            # Create empty tensor with correct dimensions
-            local_embeddings = torch.empty(0, 512, device=self.device)  # Assuming 512-dim embeddings
+            # Create empty tensor - we'll get actual dim from other ranks
+            local_embeddings = torch.empty(0, 0)
         
-        # Gather all embeddings from all ranks
-        print_master(f"Rank {rank}: Gathering candidate embeddings...")
+        # Get embedding dimension dynamically
+        local_dim = torch.tensor([local_embeddings.size(1) if local_embeddings.numel() > 0 else 0], dtype=torch.long, device=self.device)
+        dim_list = [torch.zeros_like(local_dim) for _ in range(world_size)]
+        dist.all_gather(dim_list, local_dim)
         
-        # Get embedding dimension from local embeddings
-        if local_embeddings.numel() > 0:
-            embedding_dim = local_embeddings.size(1)
-        else:
-            # Fallback: get dimension from any non-empty rank
-            embedding_dim = 512  # Default assumption
+        embedding_dim = max([d.item() for d in dim_list])
+        if embedding_dim == 0:
+            embedding_dim = 512  # Fallback
         
-        # Create properly sized tensors for gathering
-        max_local_images = images_per_gpu
-        padded_embeddings = torch.zeros(max_local_images, embedding_dim, device=self.device)
-        actual_local_size = local_embeddings.size(0)
-        if actual_local_size > 0:
-            padded_embeddings[:actual_local_size] = local_embeddings
+        # Ensure local_embeddings has correct dimension
+        if local_embeddings.numel() == 0:
+            local_embeddings = torch.empty(0, embedding_dim)
         
-        # Gather padded embeddings
-        embedding_list = [torch.zeros_like(padded_embeddings) for _ in range(world_size)]
-        dist.all_gather(embedding_list, padded_embeddings)
+        # Use all_gather_into_tensor for better efficiency
+        local_size = images_per_gpu
+        padded_embeddings = torch.zeros(local_size, embedding_dim, device=self.device)
+        if local_embeddings.size(0) > 0:
+            padded_embeddings[:local_embeddings.size(0)] = local_embeddings.to(self.device)
         
-        # Reconstruct full embedding matrix
-        all_embeddings = []
-        for i, emb in enumerate(embedding_list):
-            gpu_start = i * images_per_gpu
-            gpu_end = min(gpu_start + images_per_gpu, total_images)
-            actual_size = gpu_end - gpu_start
-            if actual_size > 0:
-                all_embeddings.append(emb[:actual_size])
+        # Efficient tensor gathering
+        output_shape = [padded_total, embedding_dim]
+        gathered_embeddings = torch.empty(output_shape, dtype=padded_embeddings.dtype, device=self.device)
+        dist.all_gather_into_tensor(gathered_embeddings, padded_embeddings)
         
-        full_embeddings = torch.cat(all_embeddings, dim=0)
-        print_master(f"Rank {rank}: Reconstructed {full_embeddings.size(0)} candidate embeddings")
+        # Trim back to original size and move to CPU
+        final_embeddings = gathered_embeddings[:total_images].cpu()
+        print_master(f"Rank {rank}: Reconstructed {final_embeddings.size(0)} candidate embeddings")
         
-        return full_embeddings
+        return final_embeddings
     
     def _encode_queries_distributed(self) -> torch.Tensor:
         """
-        Distributed encoding of queries
+        Distributed encoding of queries with improved efficiency
         Each GPU processes a subset of queries, then all embeddings are gathered
         """
         import torch.distributed as dist
@@ -496,55 +513,67 @@ class CIRREvaluator:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         
-        # Split queries across GPUs
+        # Ensure data is evenly divisible (pad if necessary)
         total_queries = len(self.test_data)
         queries_per_gpu = (total_queries + world_size - 1) // world_size
-        start_idx = rank * queries_per_gpu
-        end_idx = min(start_idx + queries_per_gpu, total_queries)
+        padded_total = queries_per_gpu * world_size
         
-        local_queries = self.test_data[start_idx:end_idx]
+        # Pad queries if necessary for even distribution
+        if padded_total > total_queries:
+            padding_needed = padded_total - total_queries
+            # Repeat from beginning to pad
+            padding_queries = self.test_data[:padding_needed]
+            test_data_padded = self.test_data + padding_queries
+            print_master(f"Padded queries: {total_queries} -> {padded_total}")
+        else:
+            test_data_padded = self.test_data
+        
+        # Split evenly across GPUs
+        start_idx = rank * queries_per_gpu
+        end_idx = start_idx + queries_per_gpu
+        
+        local_queries = test_data_padded[start_idx:end_idx]
         print_master(f"Rank {rank}: Encoding queries {start_idx}-{end_idx-1} ({len(local_queries)} queries)")
         
-        # Encode local subset of queries
+        # Encode local subset with mixed precision
         if len(local_queries) > 0:
-            local_embeddings = self._encode_composed_queries_local(local_queries)
+            with torch.autocast(enabled=True, dtype=torch.bfloat16, device_type="cuda"):
+                local_embeddings = self._encode_composed_queries_local(local_queries)
+            # Move to CPU to avoid GPU memory issues during gathering
+            local_embeddings = local_embeddings.cpu()
         else:
-            # Create empty tensor with correct dimensions
-            local_embeddings = torch.empty(0, 512, device=self.device)  # Assuming 512-dim embeddings
+            # Create empty tensor - we'll get actual dim from other ranks
+            local_embeddings = torch.empty(0, 0)
         
-        # Gather all embeddings from all ranks
-        print_master(f"Rank {rank}: Gathering query embeddings...")
+        # Get embedding dimension dynamically
+        local_dim = torch.tensor([local_embeddings.size(1) if local_embeddings.numel() > 0 else 0], dtype=torch.long, device=self.device)
+        dim_list = [torch.zeros_like(local_dim) for _ in range(world_size)]
+        dist.all_gather(dim_list, local_dim)
         
-        # Get embedding dimension
-        if local_embeddings.numel() > 0:
-            embedding_dim = local_embeddings.size(1)
-        else:
-            embedding_dim = 512  # Default assumption
+        embedding_dim = max([d.item() for d in dim_list])
+        if embedding_dim == 0:
+            embedding_dim = 512  # Fallback
         
-        # Create properly sized tensors for gathering
-        max_local_queries = queries_per_gpu
-        padded_embeddings = torch.zeros(max_local_queries, embedding_dim, device=self.device)
-        actual_local_size = local_embeddings.size(0)
-        if actual_local_size > 0:
-            padded_embeddings[:actual_local_size] = local_embeddings
+        # Ensure local_embeddings has correct dimension
+        if local_embeddings.numel() == 0:
+            local_embeddings = torch.empty(0, embedding_dim)
         
-        # Gather padded embeddings
-        embedding_list = [torch.zeros_like(padded_embeddings) for _ in range(world_size)]
-        dist.all_gather(embedding_list, padded_embeddings)
+        # Use all_gather_into_tensor for better efficiency  
+        local_size = queries_per_gpu
+        padded_embeddings = torch.zeros(local_size, embedding_dim, device=self.device)
+        if local_embeddings.size(0) > 0:
+            padded_embeddings[:local_embeddings.size(0)] = local_embeddings.to(self.device)
         
-        # Reconstruct full embedding matrix
-        all_embeddings = []
-        for i, emb in enumerate(embedding_list):
-            gpu_start = i * queries_per_gpu
-            gpu_end = min(gpu_start + queries_per_gpu, total_queries)
-            actual_size = gpu_end - gpu_start
-            if actual_size > 0:
-                all_embeddings.append(emb[:actual_size])
+        # Efficient tensor gathering
+        output_shape = [padded_total, embedding_dim]
+        gathered_embeddings = torch.empty(output_shape, dtype=padded_embeddings.dtype, device=self.device)
+        dist.all_gather_into_tensor(gathered_embeddings, padded_embeddings)
         
-        full_embeddings = torch.cat(all_embeddings, dim=0)
-        print_master(f"Rank {rank}: Reconstructed {full_embeddings.size(0)} query embeddings")
+        # Trim back to original size and move to CPU
+        final_embeddings = gathered_embeddings[:total_queries].cpu()
+        print_master(f"Rank {rank}: Reconstructed {final_embeddings.size(0)} query embeddings")
         
-        return full_embeddings
+        return final_embeddings
     
     def _encode_images_local(self, image_names: List[str]) -> torch.Tensor:
         """Encode a subset of images on local GPU (used by distributed encoding)"""

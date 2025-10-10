@@ -8,6 +8,7 @@ import logging
 import os
 import os.path
 import sys
+import datetime
 
 # Enable wandb for production training monitoring
 # os.environ['WANDB_DISABLED'] = 'true'  # Commented out to enable wandb
@@ -27,55 +28,64 @@ from src.arguments import ModelArguments, DataArguments, TrainingArguments
 from src.data.collator.train_collator import MultimodalDataCollator
 from src.data.loader.mixed_dataset import init_mixed_dataset
 from src.model.model import MMEBModel
-from src.trainer_iterative import IterativeRetrievalTrainer, create_iterative_trainer
-from src.data.dataset.composed_retrieval_dataset import IterativeCIRRDataset, IterativeFashionIQDataset
+from src.trainer_iterative_ import IterativeRetrievalTrainer, create_iterative_trainer
 from src.utils import print_rank, print_master, find_latest_checkpoint
 from src.model.processor import load_processor, get_backbone_name
 
 
-def load_foundation_model(model_args, data_args):
-    """Load foundation model for caption generation"""
-    foundation_model_name = getattr(model_args, 'foundation_model_name', None)
+# import debugpy
+# try:
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9501))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     pass
+
+
+# def load_foundation_model(model_args, data_args):
+#     """Load foundation model for caption generation"""
+#     foundation_model_name = getattr(model_args, 'foundation_model_name', None)
     
-    if foundation_model_name:
-        print_master(f"Loading foundation model: {foundation_model_name}")
+#     if foundation_model_name:
+#         print_master(f"Loading foundation model: {foundation_model_name}")
         
-        # Load foundation model directly from transformers (not wrapped by MMEBModel)
-        from transformers import AutoModelForVision2Seq, AutoProcessor
-        import torch.distributed as dist
+#         # Load foundation model directly from transformers (not wrapped by MMEBModel)
+#         from transformers import AutoModelForVision2Seq, AutoProcessor
+#         import torch.distributed as dist
         
-        # Check if we're in distributed mode to avoid tensor parallel issues
-        if dist.is_initialized():
-            # Distributed mode: avoid device_map to prevent tensor parallel conflicts
-            foundation_model = AutoModelForVision2Seq.from_pretrained(
-                foundation_model_name,
-                torch_dtype=torch.bfloat16,
-                device_map=None,  # Avoid tensor parallel issues in PyTorch 2.4
-                trust_remote_code=True
-            )
-        else:
-            # Single GPU mode: use device_map="auto" for convenience
-            foundation_model = AutoModelForVision2Seq.from_pretrained(
-                foundation_model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True
-            )
+#         # Check if we're in distributed mode to avoid tensor parallel issues
+#         if dist.is_initialized():
+#             # Distributed mode: avoid device_map to prevent tensor parallel conflicts
+#             foundation_model = AutoModelForVision2Seq.from_pretrained(
+#                 foundation_model_name,
+#                 torch_dtype=torch.bfloat16,
+#                 device_map=None,  # Avoid tensor parallel issues in PyTorch 2.4
+#                 trust_remote_code=True
+#             )
+#         else:
+#             # Single GPU mode: use device_map="auto" for convenience
+#             foundation_model = AutoModelForVision2Seq.from_pretrained(
+#                 foundation_model_name,
+#                 torch_dtype=torch.bfloat16,
+#                 device_map="auto",
+#                 trust_remote_code=True
+#             )
         
-        # Load processor
-        foundation_processor = AutoProcessor.from_pretrained(
-            foundation_model_name,
-            trust_remote_code=True
-        )
+#         # Load processor
+#         foundation_processor = AutoProcessor.from_pretrained(
+#             foundation_model_name,
+#             trust_remote_code=True
+#         )
         
-        # Attach processor to model for easy access
-        setattr(foundation_model, 'processor', foundation_processor)
+#         # Attach processor to model for easy access
+#         setattr(foundation_model, 'processor', foundation_processor)
         
-        print_master(f"Foundation model loaded: {foundation_model_name}")
-        return foundation_model
-    else:
-        print_master("No foundation model specified")
-        return None
+#         print_master(f"Foundation model loaded: {foundation_model_name}")
+#         return foundation_model
+#     else:
+#         print_master("No foundation model specified")
+#         return None
 
 
 def main():
@@ -107,7 +117,6 @@ def main():
             print(f"torch.distributed.get_rank(): {torch.distributed.get_rank()}")
             print(f"torch.distributed.get_world_size(): {torch.distributed.get_world_size()}")
 
-    # Check for existing checkpoints (removed - now handled by new recovery system)
 
     # Set up logging_dir for train.log generation if not specified
     if not training_args.logging_dir:
@@ -148,25 +157,84 @@ def main():
     
     print_master("=" * 60)
     print_master("CHECKPOINT RECOVERY SYSTEM")
+    print_master("🔧 NEW: Each iteration saves checkpoints in separate subdirectories")
+    print_master("   - training_iter_0/: Base model training checkpoints")  
+    print_master("   - training_iter_1/: Iteration 1 training checkpoints")
+    print_master("   - training_iter_2/: Iteration 2 training checkpoints")
+    print_master("   - base_model/, iteration_1/, iteration_2/: Final models")
     print_master("=" * 60)
     
     # 1. Trainer checkpoint恢复 (包含optimizer/scheduler state)
+    # 🔧 新策略：在子目录中查找最新的训练checkpoint
     trainer_checkpoint = None
     if training_args.resume_from == 'auto':
+        # 首先尝试在主目录查找（兼容旧版本）
         trainer_checkpoint = find_latest_checkpoint(training_args.output_dir)
-        if trainer_checkpoint:
-            print_master(f"📁 Found trainer checkpoint: {trainer_checkpoint}")
-            print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+        
+        # 如果主目录没有找到，在子目录中查找最新的checkpoint
+        if not trainer_checkpoint:
+            print_master("🔍 Searching for checkpoints in iteration subdirectories...")
+            latest_iteration_dir = None
+            latest_step = -1
+            
+            # 遍历所有可能的训练子目录
+            for i in range(10, -1, -1):  # 从最新的迭代开始查找
+                iteration_dir = os.path.join(training_args.output_dir, f"training_iter_{i}")
+                if os.path.exists(iteration_dir):
+                    # 在这个子目录中查找checkpoint
+                    iter_checkpoint = find_latest_checkpoint(iteration_dir)
+                    if iter_checkpoint:
+                        # 提取step number
+                        checkpoint_name = os.path.basename(iter_checkpoint)
+                        if checkpoint_name.startswith('checkpoint-'):
+                            try:
+                                step_num = int(checkpoint_name.split('-')[1])
+                                # 由于每轮训练都从0开始，我们需要考虑迭代顺序
+                                # 更新的迭代具有更高的优先级
+                                effective_step = i * 10000 + step_num  # 迭代权重 + 步数
+                                if effective_step > latest_step:
+                                    latest_step = effective_step
+                                    latest_iteration_dir = iteration_dir
+                                    trainer_checkpoint = iter_checkpoint
+                                    print_master(f"Found checkpoint in iteration {i}: {iter_checkpoint}")
+                            except ValueError:
+                                continue
+            
+            if trainer_checkpoint:
+                print_master(f"📁 Found trainer checkpoint in subdirectory: {trainer_checkpoint}")
+                print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+            else:
+                print_master("📁 No trainer checkpoint found in main directory or subdirectories")
         else:
-            print_master("📁 No trainer checkpoint found")
+            print_master(f"📁 Found trainer checkpoint in main directory: {trainer_checkpoint}")
+            print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+            
     elif training_args.resume_from.isdigit():
-        trainer_checkpoint = os.path.join(training_args.output_dir, f'checkpoint-{training_args.resume_from}')
-        if os.path.exists(trainer_checkpoint):
-            print_master(f"📁 Using specified trainer checkpoint: {trainer_checkpoint}")
-            print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
-        else:
-            print_master(f"📁 Specified trainer checkpoint not found: {trainer_checkpoint}")
-            trainer_checkpoint = None
+        # 用户指定checkpoint step number - 需要在子目录中查找
+        checkpoint_step = training_args.resume_from
+        checkpoint_found = False
+        
+        # 在所有子目录中查找指定的checkpoint
+        for i in range(10, -1, -1):
+            iteration_dir = os.path.join(training_args.output_dir, f"training_iter_{i}")
+            potential_checkpoint = os.path.join(iteration_dir, f'checkpoint-{checkpoint_step}')
+            if os.path.exists(potential_checkpoint):
+                trainer_checkpoint = potential_checkpoint
+                checkpoint_found = True
+                print_master(f"📁 Found specified checkpoint in iteration {i}: {trainer_checkpoint}")
+                print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+                break
+        
+        # 也检查主目录（向后兼容）
+        if not checkpoint_found:
+            main_checkpoint = os.path.join(training_args.output_dir, f'checkpoint-{checkpoint_step}')
+            if os.path.exists(main_checkpoint):
+                trainer_checkpoint = main_checkpoint
+                print_master(f"📁 Found specified checkpoint in main directory: {trainer_checkpoint}")
+                print_master(f"   ✅ Contains: model weights + optimizer + scheduler states")
+            else:
+                print_master(f"📁 Specified trainer checkpoint not found: checkpoint-{checkpoint_step}")
+                
     elif training_args.resume_from != 'none':
         print_master(f"⚠️  Unknown resume_from format: {training_args.resume_from}")
     
@@ -318,10 +386,16 @@ def main():
     
     # Load processor
     processor = load_processor(model_args, data_args)
+    
+    # # 🔥 添加这一行来优化processor
+    # processor = optimize_processor_for_memory(processor, max_pixels=200704)  # 448x448
+
     setattr(model, 'processor', processor)
 
     # Load foundation model for caption generation
-    foundation_model = load_foundation_model(model_args, data_args)
+    # foundation_model = load_foundation_model(model_args, data_args)
+    foundation_model = None  # 不预加载
+    foundation_model_name = getattr(model_args, "foundation_model_name", None)  # 例如 "Qwen2-VL-7B-Instruct"
 
     # Load dataset configuration
     with open(data_args.dataset_config, 'r') as yaml_file:
@@ -388,7 +462,8 @@ def main():
         
         trainer = create_iterative_trainer(
             model=model,
-            foundation_model=foundation_model,
+            foundation_model=None,                   # 不传实例
+            foundation_model_name=foundation_model_name,  # 只传名字
             processing_class=processor,
             args=training_args,
             model_args=model_args,
@@ -421,6 +496,7 @@ def main():
         trainer = IterativeRetrievalTrainer(
             model=model,
             foundation_model=foundation_model,
+            foundation_model_name=foundation_model_name,  # <--- 补上这一行
             processing_class=processor,
             args=training_args,
             model_args=model_args,

@@ -12,14 +12,19 @@ CIRR:
     weight: 1.0
     
     # Iterative training specific configs - PRODUCTION
-    max_iterations: 3  # Full iterative training cycles
+    max_iterations: 2  # Full iterative training cycles
     hard_neg_collection_freq: 1
     hard_neg_top_k: 10
     caption_generation_batch_size: 16  # Increased for 8-GPU production
     
     # Production mode settings - ENABLED for production training
+    # 🔄 NEW INDEPENDENT TRAINING STRATEGY:
+    # Each iteration resets optimizer/scheduler for independent LR schedule
+    # - steps_per_iteration: 2500 steps per iteration
+    # - warmup_steps: 250 (10% of steps_per_iteration, set in training script)
+    # - This ensures fresh learning rate for each iteration's hard negative learning
     fast_mode: false  # Disable fast mode for production
-    steps_per_iteration: 2500  # Steps for each iteration (was production_max_steps)
+    steps_per_iteration: 5000  # Steps per iteration (each iteration trains independently)
     production_save_steps: 500   # Save every 500 steps
     production_eval_steps: 1000  # Evaluate every 1000 steps
     production_logging_steps: 50  # Log every 50 steps

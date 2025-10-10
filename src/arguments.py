@@ -51,8 +51,15 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(TrainingArguments):
+    output_dir: str = field(
+        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+    )
+    group_by_reference_image: bool = field(
+        default=False, metadata={"help": "Group samples by reference image into the same batch during iterative training."}
+    )
+    # evaluation_strategy: str = field(default='no', metadata={"help": "The evaluation strategy to adopt during training. Possible values are: 'no', 'steps', 'epoch'"})
+    # per_device_train_batch_size: int = field(default=8, metadata={"help": "The batch size per GPU/TPU core/CPU for training."})
     image_encoder_freeze: bool = field(default=False, metadata={"help": "huggingface model name"})
-    output_dir: str = field(default=None, metadata={"help": "directory for saving trained models"})
     resume_from: str = field(default="none", metadata={"help": "`auto` will detect if any previous checkpoints should be resumed. or specify specific step of the checkpoint."})
     resume_from_iteration: str = field(default="none", metadata={"help": "Resume from a specific iteration model: `auto`, `iter_0`, `iter_1`, etc. This loads model weights only without training state."})
     project_name: str = field(default=None, metadata={"help": "project name"})

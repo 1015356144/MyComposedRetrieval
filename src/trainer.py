@@ -21,6 +21,10 @@ from src.model.model import MMEBModel
 from src.loss import SimpleContrastiveLoss, DistributedContrastiveLoss
 from src.grad_cache.grad_cache import GradCache
 from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
+from torch.utils.data.distributed import DistributedSampler
+
+# grouped sampler
+from src.data.sampler.grouped_sampler import DistributedGroupedBatchSampler
 
 from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
 from transformers.trainer_callback import (
@@ -65,6 +69,35 @@ else:
     IS_XLA_FSDPV2_POST_2_2 = False
 
 logger = logging.get_logger(__name__)
+
+
+class DistBatchSamplerWrapper:
+    """Wrap a *global* batch_sampler and slice batches per rank for DDP.
+    This is a non-invasive fallback when the underlying sampler isn't DDP-aware.
+    """
+    def __init__(self, batch_sampler, world_size: int, rank: int):
+        self.batch_sampler = batch_sampler
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self._epoch = 0
+
+    def __iter__(self):
+        # propagate epoch if supported
+        if hasattr(self.batch_sampler, "set_epoch"):
+            self.batch_sampler.set_epoch(self._epoch)
+        for i, batch in enumerate(self.batch_sampler):
+            if (i % self.world_size) == self.rank:
+                yield batch
+
+    def __len__(self):
+        total = len(self.batch_sampler)
+        return (total + self.world_size - 1) // self.world_size
+
+    def set_epoch(self, epoch: int):
+        self._epoch = int(epoch)
+        if hasattr(self.batch_sampler, "set_epoch"):
+            self.batch_sampler.set_epoch(epoch)
+
 
 class MMEBTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -114,74 +147,125 @@ class MMEBTrainer(Trainer):
 
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
-
+    # ---------- Sampler selection (DDP-aware) ----------
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        # override original trainer's method
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
+
+        is_iterative_phase = hasattr(self, 'current_iteration') and self.current_iteration > 0
+        per_device_bs = int(getattr(self, "_train_batch_size", self.args.per_device_train_batch_size))
+
+        # ✅ 分组采样路径：使用 DDP 友好的 DistributedGroupedBatchSampler（充填到定长）
+        if is_iterative_phase and getattr(self.args, 'group_by_reference_image', False):
+            print_master(
+                f"✅ Using GroupedBatchSampler for iterative training (per-device batch ≈ {per_device_bs})."
+            )
+            return DistributedGroupedBatchSampler(
+                dataset=self.train_dataset,
+                batch_size=per_device_bs,
+                shuffle=True,
+                pad_to_full=True,                         # 关键：保证每步每卡 batch 形状一致
+                drop_last=self.args.dataloader_drop_last, # 通常 False，配合 pad_to_full
+                seed=int(getattr(self.args, 'seed', 0)),
+                world_size=self.args.world_size if self.is_ddp else 1,
+                rank=self.args.process_index if self.is_ddp else 0,
+                ref_key="reference_image",
+            )
+
+        # 非分组路径：标准 DistributedSampler
+        if self.is_ddp:
+            print_master("✅ Using DistributedSampler for true data parallel.")
+            return DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.args.world_size,
+                rank=self.args.process_index,
+                shuffle=True,
+                drop_last=self.args.dataloader_drop_last,
+            )
+        else:
+            print_master("✅ Using standard RandomSampler (single process).")
             return RandomSampler(self.train_dataset)
 
     def get_train_dataloader(self) -> DataLoader:
         """
-        override original trainer's method to disable self.accelerator.prepare since it will wrap DataLoaderDispatcher and lead to
-        (1) `RuntimeError: You can't use batches of different size with `dispatch_batches=True` or when using an `IterableDataset`.`
-        (2) all outputs of dataloader must be tensors
+        Override to avoid accelerator wrapping of DataLoader.
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
         train_dataset = self.train_dataset
         data_collator = self.data_collator
         train_dataset = self._remove_unused_columns(train_dataset, description="training")
+
+        # Add a tiny wrapper to carry sample indices for debugging/viz
+        class _AddIndexDataset(torch.utils.data.Dataset):
+            def __init__(self, base):
+                self.base = base
+            def __len__(self):
+                return len(self.base)
+            def __getitem__(self, idx):
+                item = self.base[idx]
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    q, t = item
+                    q = dict(q)
+                    q["sample_ids"] = torch.as_tensor(idx, dtype=torch.long)
+                    return (q, t)
+                x = dict(item)
+                x["sample_ids"] = torch.as_tensor(idx, dtype=torch.long)
+                return x
+
+        train_dataset = _AddIndexDataset(train_dataset)
+
+        sampler = self._get_train_sampler()
+
         dataloader_params = {
-            "batch_size": self._train_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
             "persistent_workers": self.args.dataloader_persistent_workers,
         }
-        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
-            dataloader_params["sampler"] = self._get_train_sampler()
+
+        # If sampler acts as a batch_sampler, set accordingly
+        if (
+            hasattr(sampler, "__iter__")
+            and hasattr(sampler, "__len__")
+            and not isinstance(sampler, (RandomSampler, DistributedSampler, SequentialSampler))
+        ):
+            dataloader_params["batch_sampler"] = sampler
+        else:
+            dataloader_params["batch_size"] = int(getattr(self, "_train_batch_size", self.args.per_device_train_batch_size))
+            dataloader_params["sampler"] = sampler
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            # Create a wrapper function for seed_worker
+
+        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             def worker_init_fn(worker_id):
                 return seed_worker(worker_id, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index)
             dataloader_params["worker_init_fn"] = worker_init_fn
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
-        else:
-            dataloader_params["sampler"] = None
-            dataloader_params["shuffle"] = False
-            dataloader_params["drop_last"] = True
-            dataloader_params["prefetch_factor"] = None # # tune on both prefetch_factor and persistent_workers will cause hang at epoch2
+
         return DataLoader(train_dataset, **dataloader_params)
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        """
-        Load checkpoint with smart model loading logic for iterative training
-        """
         print_master(f"Loading checkpoint from {resume_from_checkpoint}")
-        
-        # For iterative training, skip model reloading if the model was already loaded
-        # from iteration checkpoint in train_iterative.py
-        if (hasattr(self.args, 'max_iterations') and self.args.max_iterations > 0 and 
-            hasattr(self.model_args, 'checkpoint_path') and 
-            'iteration_' in str(self.model_args.checkpoint_path) or 'base_model' in str(self.model_args.checkpoint_path)):
+        if (
+            hasattr(self.args, 'max_iterations') and self.args.max_iterations > 0 and
+            hasattr(self.model_args, 'checkpoint_path') and
+            'iteration_' in str(self.model_args.checkpoint_path) or 'base_model' in str(self.model_args.checkpoint_path)
+        ):
             print_master("🎯 Iterative training detected with iteration model already loaded")
             print_master("   ➡️  Skipping model reload, using current model state")
             print_master("   ➡️  Will only load training state (optimizer, scheduler, etc.)")
             return
-            
-        # For standard training or when using trainer checkpoint
+
         print_master("📁 Loading model from trainer checkpoint")
         if not os.path.isdir(resume_from_checkpoint):
             raise ValueError(f"Checkpoint directory {resume_from_checkpoint} does not exist")
-            
-        # Check if config.json exists in checkpoint
+
         config_path = os.path.join(resume_from_checkpoint, "config.json")
         if not os.path.exists(config_path):
             print_master("⚠️  No config.json found in trainer checkpoint")
             print_master("   ➡️  Will keep current model and only load training state")
             return
-            
+
         self.model_args.checkpoint_path = resume_from_checkpoint
         self.model = MMEBModel.load(self.model_args)
         self.model_wrapped = self.model
@@ -194,26 +278,18 @@ class MMEBTrainer(Trainer):
         if self.args.auto_find_batch_size:
             if self.state.train_batch_size != self._train_batch_size:
                 from accelerate.utils import release_memory
-
                 (self.model_wrapped,) = release_memory(self.model_wrapped)
                 self.model_wrapped = self.model
-
-                # Check for DeepSpeed *after* the intial pass and modify the config
                 if self.is_deepspeed_enabled:
-                    # Temporarily unset `self.args.train_batch_size`
                     original_bs = self.args.per_device_train_batch_size
                     self.args.per_device_train_batch_size = self._train_batch_size // max(1, self.args.n_gpu)
                     self.propagate_args_to_deepspeed(True)
                     self.args.per_device_train_batch_size = original_bs
             self.state.train_batch_size = self._train_batch_size
         logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
-        # Data loader and number of training steps
+
         train_dataloader = self.get_train_dataloader()
 
-        # Setting up training control variables:
-        # number of training epochs: num_train_epochs
-        # number of training steps per epoch: num_update_steps_per_epoch
-        # total number of training steps to execute: max_steps
         total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps * args.world_size
 
         len_dataloader = None
@@ -223,13 +299,21 @@ class MMEBTrainer(Trainer):
             num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
             num_examples = self.num_examples(train_dataloader)
+
+            print_master(f"🔍 DEBUG - Dataloader Analysis:")
+            print_master(f"  len_dataloader: {len_dataloader}")
+            print_master(f"  num_examples: {num_examples}")
+            print_master(f"  world_size: {args.world_size}")
+            print_master(f"  num_update_steps_per_epoch: {num_update_steps_per_epoch}")
+            if hasattr(self.train_dataset, '__len__'):
+                print_master(f"  dataset.__len__(): {len(self.train_dataset)}")
+            print_master(f"  Using sampler type: {type(self._get_train_sampler()).__name__}")
+            print_master(f"🔍 ---------------")
             if args.max_steps > 0:
                 max_steps = args.max_steps
                 num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
                     args.max_steps % num_update_steps_per_epoch > 0
                 )
-                # May be slightly incorrect if the last batch in the training dataloader has a smaller size but it's
-                # the best we can do.
                 num_train_samples = args.max_steps * total_train_batch_size
                 if args.include_tokens_per_second:
                     num_train_tokens = (
@@ -241,9 +325,8 @@ class MMEBTrainer(Trainer):
                 num_train_samples = self.num_examples(train_dataloader) * args.num_train_epochs
                 if args.include_tokens_per_second:
                     num_train_tokens = self.num_tokens(train_dataloader) * args.num_train_epochs
-        elif args.max_steps > 0:  # Rely on max_steps when dataloader does not have a working size
+        elif args.max_steps > 0:
             max_steps = args.max_steps
-            # Setting a very large number of epochs so we go as many times as necessary over the iterator.
             num_train_epochs = sys.maxsize
             num_update_steps_per_epoch = max_steps
             num_examples = total_train_batch_size * args.max_steps
@@ -258,7 +341,6 @@ class MMEBTrainer(Trainer):
 
         delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
 
-        # We need to reset the scheduler, as its parameters may be different on subsequent calls
         if self._created_lr_scheduler:
             self.lr_scheduler = None
             self._created_lr_scheduler = False
@@ -273,7 +355,6 @@ class MMEBTrainer(Trainer):
         self.state.is_hyper_param_search = trial is not None
         self.state.train_batch_size = self._train_batch_size
 
-        # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
                 self.state.logging_steps = math.ceil(max_steps * args.logging_steps)
@@ -290,15 +371,11 @@ class MMEBTrainer(Trainer):
             else:
                 self.state.save_steps = args.save_steps
 
-        # Activate gradient checkpointing if needed
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
 
         model = self._wrap_model(self.model_wrapped)
 
-        # as the model is wrapped, don't use `accelerator.prepare`
-        # this is for unhandled cases such as
-        # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
         use_accelerator_prepare = True if model is self.model else False
 
         if delay_optimizer_creation:
@@ -307,7 +384,6 @@ class MMEBTrainer(Trainer):
                 self.model = self.accelerator.prepare(self.model)
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
-        # prepare using `accelerator` prepare
         if use_accelerator_prepare:
             self.model.train()
             if hasattr(self.lr_scheduler, "step"):
@@ -316,34 +392,23 @@ class MMEBTrainer(Trainer):
                 else:
                     model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
             else:
-                # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
                 model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
                     self.model, self.optimizer, self.lr_scheduler
                 )
         elif self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
-            # In this case we are in DDP + LOMO, which should be supported
             self.optimizer = self.accelerator.prepare(self.optimizer)
 
         if self.is_fsdp_enabled:
             self.model = self.model_wrapped = model
 
-        # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
             self.model_wrapped = model
 
-        # backward compatibility
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model_wrapped
 
-        # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
-        # important: at this point:
-        # self.model         is the Transformers Model
-        # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model),
-        # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
-
-        # Train!
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples:,}")
         logger.info(f"  Num Epochs = {num_train_epochs:,}")
@@ -361,10 +426,6 @@ class MMEBTrainer(Trainer):
         steps_trained_in_current_epoch = 0
         steps_trained_progress_bar = None
 
-        # @ruimeng use steps_trained_in_current_epoch to skip batches for finding buggy data
-        # steps_trained_in_current_epoch = 42
-
-        # Check if continuing training from a checkpoint
         if resume_from_checkpoint is not None and os.path.isfile(
             os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
         ):
@@ -387,21 +448,16 @@ class MMEBTrainer(Trainer):
                     f" {steps_trained_in_current_epoch} batches in the first epoch."
                 )
 
-        # Update the references
         self.callback_handler.model = self.model
         self.callback_handler.optimizer = self.optimizer
         self.callback_handler.lr_scheduler = self.lr_scheduler
         self.callback_handler.train_dataloader = train_dataloader
-        # This should be the same if the state has been saved but in case the training arguments changed, it's safer
-        # to set this after the load.
         self.state.max_steps = max_steps
         self.state.num_train_epochs = num_train_epochs
         self.state.is_local_process_zero = self.is_local_process_zero()
         self.state.is_world_process_zero = self.is_world_process_zero()
 
-        # tr_loss is a tensor to avoid synchronization of TPUs through .item()
         tr_loss = torch.tensor(0.0).to(args.device)
-        # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
         model.zero_grad()
@@ -414,11 +470,16 @@ class MMEBTrainer(Trainer):
         total_batched_samples = 0
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_dataloader = train_dataloader
-            if hasattr(epoch_dataloader.dataset, "set_epoch"):
-                # print(f'\t\tSetting new epoch={epoch}')
-                epoch_dataloader.dataset.set_epoch(epoch)
 
-            # Reset the past mems state at the beginning of each epoch if necessary.
+            # IMPORTANT: set_epoch on (batch_)sampler, not dataset
+            _bs = getattr(epoch_dataloader, "batch_sampler", None)
+            if hasattr(_bs, "set_epoch"):
+                _bs.set_epoch(epoch)
+            else:
+                _s = getattr(epoch_dataloader, "sampler", None)
+                if hasattr(_s, "set_epoch"):
+                    _s.set_epoch(epoch)
+
             if args.past_index >= 0:
                 self._past = None
 
@@ -427,6 +488,13 @@ class MMEBTrainer(Trainer):
                 if len_dataloader is not None
                 else args.max_steps * args.gradient_accumulation_steps
             )
+
+            if epoch == 0:
+                print_master(f"🔍 DEBUG - Epoch Calculation Setup:")
+                print_master(f"  steps_in_epoch: {steps_in_epoch}")
+                print_master(f"  len(epoch_dataloader): {len(epoch_dataloader) if len_dataloader is not None else 'N/A'}")
+                print_master(f"  This will be used as denominator in: epoch + (step + 1) / steps_in_epoch")
+                print_master(f"🔍 ---------------")
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
@@ -442,7 +510,6 @@ class MMEBTrainer(Trainer):
 
             step = -1
             epoch_iterator = iter(epoch_dataloader)
-            # We chunkify the epoch iterator into gradient accumulation steps `n` batches
             remainder = num_examples % args.gradient_accumulation_steps
             num_items_in_batch = None
             if remainder == 0:
@@ -457,10 +524,35 @@ class MMEBTrainer(Trainer):
                     step += 1
                     total_batched_samples += 1
 
-                    dataset_stat = collections.Counter(inputs[0]['global_dataset_name'])
-                    # print_rank(f"dataset name: {str(set(inputs[0]['global_dataset_name']))}")
-                    # for dname, count in sorted(dataset_stat.items(), key=lambda t:t[1], reverse=True):
-                    #     print_rank(f"\t\tdataset_name={dname}, count={count}")
+                    # --- debug: print first batch sample ids on each rank ---
+                    if self.is_ddp and self.state.global_step == 0 and step == 0:
+                        try:
+                            ids = None
+                            if isinstance(inputs, (list, tuple)) and isinstance(inputs[0], dict):
+                                ids = inputs[0].get("sample_ids", None)
+                            if ids is not None:
+                                try:
+                                    local_ids = ids.detach().cpu().tolist()
+                                except Exception:
+                                    local_ids = list(ids)
+                                print_rank(f"[rank={self.args.process_index}] first batch sample_ids head: {local_ids[:8]}")
+                                if dist.is_initialized():
+                                    world_size = dist.get_world_size()
+                                    gathered = [None] * world_size
+                                    dist.all_gather_object(gathered, local_ids)
+                                    if self.args.process_index == 0:
+                                        for r, arr in enumerate(gathered):
+                                            print_master(f"[gather] rank{r} head: {arr[:8]}")
+                                        total = sum(len(a) for a in gathered)
+                                        union = set().union(*[set(a) for a in gathered])
+                                        overlap = total - len(union)
+                                        print_master(f"[gather] total ids={total}, unique={len(union)}, overlap={overlap}")
+                            else:
+                                print_rank(f"[rank={self.args.process_index}] first batch: ids=None")
+                        except Exception as e:
+                            print_rank(f"debug ids failed: {e}")
+
+                    dataset_stat = collections.Counter(inputs[0]['global_dataset_name']) if isinstance(inputs, (list, tuple)) and isinstance(inputs[0], dict) and 'global_dataset_name' in inputs[0] else {}
 
                     is_last_step_and_steps_less_than_grad_acc = (
                         steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
@@ -468,7 +560,6 @@ class MMEBTrainer(Trainer):
                     do_sync_step = is_last_step_and_steps_less_than_grad_acc or (
                         total_batched_samples % args.gradient_accumulation_steps == 0
                     )
-                    # Since we perform prefetching, we need to manually set sync_gradients
                     if not do_sync_step:
                         self.accelerator.gradient_state._set_sync_gradients(False)
                     else:
@@ -490,7 +581,6 @@ class MMEBTrainer(Trainer):
                         self._load_rng_state(resume_from_checkpoint)
                         rng_to_sync = False
 
-                    # Skip past any already trained steps if resuming training
                     if steps_trained_in_current_epoch > 0:
                         steps_trained_in_current_epoch -= 1
                         if steps_trained_progress_bar is not None:
@@ -505,7 +595,6 @@ class MMEBTrainer(Trainer):
                     if step % args.gradient_accumulation_steps == 0:
                         self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                    # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
                     context = (
                         functools.partial(self.accelerator.no_sync, model=model)
                         if i != len(batch_samples) - 1
@@ -519,7 +608,6 @@ class MMEBTrainer(Trainer):
                         and not is_torch_xla_available()
                         and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
                     ):
-                        # if loss is nan or inf simply add the average of previous logged losses
                         tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                     else:
                         if tr_loss.device != tr_loss_step.device:
@@ -531,15 +619,10 @@ class MMEBTrainer(Trainer):
                     self.current_flos += float(self.floating_point_ops(inputs))
 
                     if do_sync_step:
-                        # Since we perform prefetching, we need to manually set sync_gradients to True
                         self.accelerator.gradient_state._set_sync_gradients(True)
 
-                        # Gradient clipping
                         if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                            # deepspeed does its own clipping
-
                             if self.use_apex:
-                                # Revert to normal clipping otherwise, handling Apex or full precision
                                 _grad_norm = torch.nn.utils.clip_grad_norm_(
                                     amp.master_params(self.optimizer),
                                     args.max_grad_norm,
@@ -555,7 +638,6 @@ class MMEBTrainer(Trainer):
                                 and self.accelerator.distributed_type == DistributedType.DEEPSPEED
                             ):
                                 grad_norm = model.get_global_grad_norm()
-                                # In some cases the grad norm may not return a float
                                 if hasattr(grad_norm, "item"):
                                     grad_norm = grad_norm.item()
                             else:
@@ -569,7 +651,6 @@ class MMEBTrainer(Trainer):
 
                         optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
                         if optimizer_was_run:
-                            # Delay optimizer scheduling until metrics are generated
                             if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                                 self.lr_scheduler.step()
 
@@ -581,14 +662,10 @@ class MMEBTrainer(Trainer):
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                    # PyTorch/XLA relies on the data loader to insert the mark_step for
-                    # each step. Since we are breaking the loop early, we need to manually
-                    # insert the mark_step here.
                     if self.control.should_epoch_stop or self.control.should_training_stop:
                         if is_torch_xla_available():
                             xm.mark_step()
                         break
-                # We also need to break out of the nested loop
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     if is_torch_xla_available():
                         xm.mark_step()
@@ -608,22 +685,18 @@ class MMEBTrainer(Trainer):
                 break
 
         if args.past_index and hasattr(self, "_past"):
-            # Clean the state at the end of training
             delattr(self, "_past")
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
-            # Wait for everyone to get here so we are sure the model has been saved by process 0.
             if is_torch_xla_available():
                 xm.rendezvous("load_best_model_at_end")
             elif args.parallel_mode == ParallelMode.DISTRIBUTED:
                 dist.barrier()
-
             self._load_best_model()
 
-        # add remaining tr_loss
         self._total_loss_scalar += tr_loss.item()
-        effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
+        effective_global_step = max(self.state.global_step, 0.001)
         train_loss = self._total_loss_scalar / effective_global_step
 
         metrics = speed_metrics(
@@ -646,7 +719,6 @@ class MMEBTrainer(Trainer):
         run_dir = self._get_output_dir(trial)
         checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
 
-        # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint and process allowed to save.
         if self.args.should_save and self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
             for checkpoint in checkpoints_sorted:
                 if not os.path.samefile(checkpoint, self.state.best_model_checkpoint):
@@ -655,11 +727,8 @@ class MMEBTrainer(Trainer):
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
-        # Wait for the checkpoint to be uploaded.
         self._finish_current_push()
 
-        # After training we make sure to retrieve back the original forward pass method
-        # for the embedding layer by removing the forward post hook.
         if self.neftune_noise_alpha is not None:
             self._deactivate_neftune(self.model)
 
@@ -682,14 +751,12 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
         self._dist_loss_scale_factor = dist.get_world_size() if self.is_ddp else 1
         loss_fn_cls = DistributedContrastiveLoss if self.is_ddp else SimpleContrastiveLoss
         loss_fn = loss_fn_cls(temperature=self.model.temperature)
-        # process_fn = functools.partial(process_vlm_inputs_fns[self.args.model_backbone], processor=self.processing_class, max_length=self.max_length)
 
         self.gc = GradCache(
             models=[self.model, self.model],
             chunk_sizes=[self.args.gc_q_chunk_size, self.args.gc_p_chunk_size],
             loss_fn=loss_fn,
             split_input_fn=split_and_process_vlm_inputs,
-            # process_fn=process_fn,
             get_rep_fn=get_dense_rep,
             fp16=self.args.fp16,
             scaler=self.scaler if self.args.fp16 else None
@@ -698,6 +765,13 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         model.train()
         queries, targets = inputs
+
+        # 防止模型下游对意外 key 报错：弹掉调试字段
+        if isinstance(queries, dict) and "sample_ids" in queries:
+            queries = dict(queries)             # 浅拷贝，避免原地改
+            queries.pop("sample_ids", None)
+        # 然后再 batch_to_device / 调用模型
+        
         queries = batch_to_device(queries, model.device)
         targets = batch_to_device(targets, model.device)
         queries, targets = {'qry': queries}, {'tgt': targets}
@@ -709,7 +783,6 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
         else:
             loss = model(queries, targets)
         return loss / self._dist_loss_scale_factor
-
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         print_master(f"Saving model to {output_dir}")

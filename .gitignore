@@ -95,3 +95,5 @@ predictions/
 .Trashes
 ehthumbs.db
 Thumbs.db
+clash-for-linux-without-sudo/
+*.xlsx
