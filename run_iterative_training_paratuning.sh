@@ -7,7 +7,7 @@
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 2
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 8
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 2 ./experiments/IterativeCIRR_qwen2vl_20250805_000011
-#
+#   bash ./run_iterative_training_paratuning.sh cirr qwen2_5vl_7b 1
 # Notes:
 # - This script uses LoRA with r=16, dropout=0.1 and (default) alpha=32 (override via $LORA_ALPHA).
 # - Iterative training with grouped-by-reference-image sampler remains enabled.

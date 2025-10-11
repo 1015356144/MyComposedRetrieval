@@ -27,6 +27,11 @@ LLAVA_IMAGE_TOKEN_ID = 32000
 
 
 def split_and_process_vlm_inputs(model_input: dict, chunk_size: int):
+    '''
+    通用批切分器：对每个键，若为 Tensor 则按 dim=0 用 chunk_size 拆分，
+    否则视为序列按同样步长切片；保持键集合不变并重组为 [{arg_key: chunk_dict}, ...]。
+    适用于所有键都与样本维对齐的输入；若图像是按全局图片数堆叠，请改用专门的 split_vlm_inputs。
+    '''
     assert len(model_input) == 1
     arg_key = list(model_input.keys())[0]
     arg_val = model_input[arg_key]
@@ -46,6 +51,11 @@ def split_and_process_vlm_inputs(model_input: dict, chunk_size: int):
 
 
 def split_vlm_inputs(model_input: dict, chunk_size: int):
+    '''
+    将多模态批输入按 batch 维以 chunk_size 切分：文本张量(input_ids/attention_mask)等长切，
+    图像张量(pixel_values/image_sizes)按每个 chunk 内“含图样本数”切分并对无图 chunk 省略图像键，
+    保证图文对齐后返回 [{arg_key: chunk_dict}, ...] 的列表。
+    '''
     assert len(model_input) == 1
     arg_key = list(model_input.keys())[0]
     arg_val = model_input[arg_key]
@@ -146,10 +156,10 @@ class MultimodalDataCollator:
                 text, raw_images = example[text_keyname], example[image_keyname]
                 
                 # 🔥 更积极的文本长度限制 - 专门针对增强数据的长文本问题
-                if text and len(text) > 400:  # 降低到400字符（约100 tokens）
+                if text and len(text) > 1000:  # 降低到1000字符（约250 tokens）
                     self.long_text_count += 1
                     original_len = len(text)
-                    text = text[:400]  # 截断到400字符
+                    text = text[:1000]  # 截断到1000字符
                     if self.long_text_count <= 10:  # 增加警告显示数量以便观察
                         print_rank(f"⚠️  Long text truncated: {original_len} -> {len(text)} chars")
                 

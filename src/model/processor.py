@@ -31,7 +31,6 @@ LLAVA_NEXT = 'llava_next'
 QWEN2_VL = 'qwen2_vl'
 QWEN2_VL_TOKENSELECTION = 'qwen2_vl'
 QWEN2_5_VL = 'qwen2_5_vl'
-QWEN2_VL_TOKENSELECTION = 'qwen2_vl_tokenselection'
 QWEN2_5_VL_TOKENSELECTION = 'qwen2_5_vl_tokenselection'
 INTERNVIDEO2 = 'internvideo2'
 GME = 'gme'  # QWEN2-VL
@@ -720,8 +719,30 @@ def e5_v_prompt_template(text, add_video_token, add_image_token):
     return prompt
 
 
+def qwen_retrieval_prompt_template(text, add_video_token, add_image_token):
+    """Qwen 系列用于检索的 prompt 模板。
+    注意：此处无法得知实际图片数量，因此当存在图片/视频时，各添加一个占位片段。
+    若需要精确重复次数，可在调用处传入组合好的文本（包含多次占位符）。
+    """
+    system_prompt = ("You are a multimodal retrieval encoder (not a conversational assistant). "
+                     "Your sole function is to map any input—image(s), text, or image(s) plus text—into a "
+                     "compact embedding for nearest-neighbor retrieval in a shared space.")
+    input_str = ""
+    if add_image_token:
+        input_str += "<|vision_start|><|image_pad|><|vision_end|>"
+    if add_video_token:
+        input_str += "<|vision_start|><|video_pad|><|vision_end|>"
+    if text:
+        input_str = input_str + text
+    msg = f'<|im_start|>system\n{system_prompt}<im_end|>\n<|im_start|>user\n{input_str}<|im_end|>\n<|im_start|>assistant\n<|endoftext|>'
+    return msg
+
 PROMPT_TEMPLATE_DICT = {
     "e5_v": e5_v_prompt_template,
+    QWEN2_VL: qwen_retrieval_prompt_template,
+    QWEN2_5_VL: qwen_retrieval_prompt_template,
+    QWEN2_VL_TOKENSELECTION: qwen_retrieval_prompt_template,
+    QWEN2_5_VL_TOKENSELECTION: qwen_retrieval_prompt_template,
 }
 
 
@@ -730,12 +751,19 @@ def process_input_text(instruction, model_backbone, text=None, add_video_token=F
     # TBD: Reorganize the hard-code part for baselines such as internvideo2
     if model_backbone == "internvideo2":
         return text
+    elif model_backbone in [QWEN2_VL, QWEN2_5_VL, QWEN2_VL_TOKENSELECTION, QWEN2_5_VL_TOKENSELECTION]:
+        # 组合 instruction 与文本，按用户要求将其接在视觉占位符之后
+        combined_text = instruction if instruction else ""
+        if text:
+            combined_text = (combined_text + " " + text) if combined_text else text
+        return PROMPT_TEMPLATE_DICT[model_backbone](combined_text, add_video_token, add_image_token)
     elif model_backbone in [GME, LamRA, LamRA_QWEN2_5]:
         if text:
             return instruction + " " + text # GME and LamRA do not need special tokens
         else:
             return instruction + " "
     elif model_backbone == E5_V:
+        # e5_v 模板沿用原逻辑
         return PROMPT_TEMPLATE_DICT[model_backbone](text, add_video_token, add_image_token)
 
     prompt = instruction
