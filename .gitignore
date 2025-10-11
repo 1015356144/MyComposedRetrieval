@@ -73,7 +73,6 @@ runs/
 !*.py
 
 # Large data directories
-data/
 datasets/
 images/
 *.zip
