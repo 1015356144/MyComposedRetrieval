@@ -147,7 +147,7 @@ if (( NUM_GPUS > 1 )); then
     dataloader_workers=6
     cuda_devices="0,1,2,3"
   elif (( NUM_GPUS == 8 )); then
-    per_device_batch_size=11
+    per_device_batch_size=9
     gradient_accumulation=1
     dataloader_workers=8
     cuda_devices="0,1,2,3,4,5,6,7"

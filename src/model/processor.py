@@ -729,12 +729,13 @@ def qwen_retrieval_prompt_template(text, add_video_token, add_image_token):
                      "compact embedding for nearest-neighbor retrieval in a shared space.")
     input_str = ""
     if add_image_token:
-        input_str += "<|vision_start|><|image_pad|><|vision_end|>"
+        # input_str += "<|vision_start|><|image_pad|><|vision_end|>"
+        input_str += "<|image_pad|>"
     if add_video_token:
         input_str += "<|vision_start|><|video_pad|><|vision_end|>"
     if text:
         input_str = input_str + text
-    msg = f'<|im_start|>system\n{system_prompt}<im_end|>\n<|im_start|>user\n{input_str}<|im_end|>\n<|im_start|>assistant\n<|endoftext|>'
+    msg = f'<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{input_str}<|im_end|>\n<|im_start|>assistant\n<|endoftext|>'
     return msg
 
 PROMPT_TEMPLATE_DICT = {
