@@ -728,6 +728,22 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         completed_steps["all_steps_complete"] = all(completed_steps.values())
         return completed_steps
 
+    def _load_iteration_state(self, iteration: int):
+        """Load iteration state for resuming (model already loaded externally)"""
+        state_file = os.path.join(self.args.output_dir, f"iteration_{iteration}_state.json")
+        
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            # Note: Model weights already loaded in main script using MMEBModel.load()
+            print_master(f"Loading iteration {iteration} metadata (model loaded separately)")
+            
+            self.iteration_metrics = state.get('iteration_metrics', {})
+            print_master(f"Loaded iteration {iteration} state from {state_file}")
+        else:
+            print_master(f"No state file found for iteration {iteration}")
+
     def _summarize_results(self):
         """Summarize results across all iterations"""
         import os, json

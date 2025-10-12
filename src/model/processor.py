@@ -412,6 +412,49 @@ def Phi3V_process_fn(model_inputs: dict, processor, max_length=None):
     return inputs
 
 
+# ==== mRoPE 对齐检查工具 ====
+import torch
+
+# def _mrope_align_check_batch(batch_inputs, tokenizer, tag=""):
+#     """
+#     在进入模型前做最终检查：
+#     - 逐样本统计：文本中 <|vision_start|> 后紧跟 <|image_pad|> 的次数
+#     - 与 batch_inputs['image_grid_thw'][i] 的行数对比
+#     """
+#     ids_batch = batch_inputs["input_ids"]          # torch.LongTensor [B, L]
+#     mask_batch = batch_inputs["attention_mask"]    # torch.LongTensor [B, L]
+#     grids_list = batch_inputs.get("image_grid_thw", None)  # list[ndarray/torch] or None
+
+#     vs = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+#     vi = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+
+#     B = ids_batch.size(0)
+#     for i in range(B):
+#         ids_eff = ids_batch[i][mask_batch[i] == 1]
+#         pos_vs = (ids_eff == vs).nonzero(as_tuple=False).squeeze(-1)
+#         vision_next = ids_eff[pos_vs + 1] if pos_vs.numel() > 0 else ids_eff.new_empty(0)
+#         image_nums = int((vision_next == vi).sum().item())
+
+#         grid_rows = 0
+#         if grids_list is not None and grids_list[i] is not None:
+#             g = grids_list[i]
+#             try:
+#                 grid_rows = int(g.shape[0])
+#             except Exception:
+#                 # 兼容 list[(3,), (3,), ...] 的奇怪形态
+#                 grid_rows = len(g)
+
+#         if image_nums != grid_rows:
+#             # 打印可读文本，助定位是哪条样本出了问题
+#             text_preview = tokenizer.decode(ids_eff.tolist(), skip_special_tokens=False)
+#             raise AssertionError(
+#                 f"[mRoPE mismatch{(' '+tag) if tag else ''}] "
+#                 f"sample#{i}: text has {image_nums} <|vision_start|><|image_pad|> segments, "
+#                 f"but image_grid_thw has {grid_rows} rows.\n"
+#                 f"Decoded text (trimmed): {text_preview[:400]}"
+#             )
+
+
 def Qwen2_VL_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_length=None):
     # TODO: set separate max_len for text/visual inputs, currently max_length is only applied to text-only data
     input_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw = [], [], [], [], []
@@ -500,6 +543,24 @@ def Qwen2_VL_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_len
     inputs['pixel_values_videos'] = pixel_values_videos
     inputs['video_grid_thw'] = video_grid_thw
 
+    # === 修复开始：把 list[ (1,3) ] → (N,3) ===
+    def _stack_grids(grids_list):
+        elems = []
+        for g in grids_list:
+            if g is None:
+                continue
+            a = np.asarray(g)
+            a = a.reshape(-1, 3)           # (3,) / (1,3) / (k,3) 都标准化为 (k,3)
+            elems.append(a)
+        if len(elems) == 0:
+            return None
+        cat = np.concatenate(elems, axis=0)  # (N,3)
+        return torch.as_tensor(cat, dtype=torch.long)
+
+    inputs['image_grid_thw'] = _stack_grids(image_grid_thw)
+    inputs['video_grid_thw'] = _stack_grids(video_grid_thw)
+
+    # _mrope_align_check_batch(inputs, processor.tokenizer, tag="Qwen2_VL_process_fn")
     return inputs
 
 def Gme_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_length=None):
@@ -746,6 +807,7 @@ def process_input_text(instruction, model_backbone, text=None, add_video_token=F
         prompt = video_token + " " + prompt
     if add_image_token:
         image_token = VLM_IMAGE_TOKENS[model_backbone]
+        # image_token = "<|vision_start|>"+VLM_IMAGE_TOKENS[model_backbone]+"<|vision_end|>"
         prompt = image_token + " " + prompt
 
     return prompt

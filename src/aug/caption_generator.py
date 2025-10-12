@@ -399,7 +399,7 @@ class CaptionGenerator:
                 "avg_original_length": (sum(len(s.get("original_mod_text", "")) for s in samples) / len(samples)) if samples else 0,
                 "avg_generated_length": (sum(len(s.get("modification_text", "")) for s in samples) / len(samples)) if samples else 0,
                 "unique_reference_images": len(set(s.get("reference_image", "") for s in samples)),
-                "unique_target_images": len(set(s.get("target_image", "")) for s in samples),
+                "unique_target_images": len(set(s.get("target_image", "") for s in samples)),
             },
             "samples": samples
         }
