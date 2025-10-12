@@ -1,0 +1,90 @@
+<<<USER
+<Input>
+    "REFERENCE": <image_path>,
+    "TARGET": <image_path>,
+    "Input edit text": "Shows a dog of a different breed of the same fur color standing on a white table."
+>>>ASSISTANT
+Generate Captions:
+    Reference: [REFERENCE] A short-haired brown dog with a collar sits outdoors on a paved area; tongue out; background is blurred urban/stone texture.
+    Target: [TARGET] A long-haired cream/beige dog lies stretched out on a light-colored tabletop/bench indoors; floppy ears; long fur drapes over the edge.
+
+Decompose Intents:
+    I1 | span="a dog of a different breed" | intent="target dog breed differs from REFERENCE" | type=relative | objects=["dog","breed_difference"] | note="requires comparing REFERENCE vs TARGET appearance"
+    I2 | span="of the same fur color" | intent="target dog has same fur color as REFERENCE" | type=relative | objects=["dog","fur_color"] | note="color equality is a comparison claim"
+    I3 | span="standing" | intent="the dog should be standing" | type=absolute | objects=["dog","pose"] | note="verify from target only"
+    I4 | span="on a white table" | intent="the dog is on a white table" | type=absolute | objects=["dog","table","table_color=white"] | note="presence+color in target only"
+
+Generate Polar Questions:
+    I1 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, is the dog in the TARGET a different breed than the dog in the REFERENCE?"
+    I2 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, does the TARGET dog have the same fur color as the REFERENCE dog?"
+    I3 | scope=target_only | Q="In the TARGET image, is the dog standing?"
+    I4 | scope=target_only | Q="In the TARGET image, is the dog on a white table?"
+
+Answer Questions via Image Comparison:
+    I1 | A=Yes | evidence_target="long hair, floppy ears, different head shape" | evidence_ref="short coat, upright ears"
+    I2 | A=No | evidence_target="fur appears light cream/beige" | evidence_ref="fur appears medium brown"
+    I3 | A=No | evidence_target="body and legs lying on the surface; not upright" | evidence_ref=""
+    I4 | A=No | evidence_target="table surface is light-colored but not clearly white" | evidence_ref=""
+
+Local Edits:
+    I1 | action=keep | before="a dog of a different breed" | after="a dog of a different breed" | reason="confirmed by comparison"
+    I2 | action=rewrite | before="of the same fur color" | after="with light cream fur" | reason="target color differs from REFERENCE"
+    I3 | action=rewrite | before="standing" | after="lying" | reason="target pose is lying"
+    I4 | action=rewrite | before="on a white table" | after="on a light-colored table" | reason="color not clearly white"
+
+Generate Text_new:
+    text_new="Shows a dog of a different breed with light cream fur lying on a light-colored table."
+
+<<<USER
+<Input>
+    "REFERENCE": <image_path>,
+    "TARGET": <image_path>,
+    "Input edit text": "Smaller dog, no background" 
+>>>ASSISTANT
+Generate Captions:
+    Reference: [REFERENCE] A slender grey dog stands on green grass in a yard. A wooden fence and trees are visible behind it. Full body is shown.
+    Target: [TARGET] A close-up of a white-and-tan spaniel face with long ears. The background is pink like a poster, with white headline text at the top.
+
+Decompose Intents:
+    I1 | span="Smaller dog" | intent="dog should appear smaller than in the REFERENCE" | type=relative | objects=["dog","size in frame"] | note="relative change of apparent size"
+    I2 | span="no background" | intent="there should be no visible background (plain/transparent)" | type=absolute | objects=["background","emptiness/plain"] | note="absolute requirement about background presence"
+
+Generate Polar Questions:
+    I1 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, does the dog appear smaller in the TARGET image than in the REFERENCE?"
+    I2 | scope=target_only | Q="In the TARGET image, is there no background visible behind the dog?"
+
+Answer Questions via Image Comparison:
+    I1 | A=No | evidence_target="the dog is a tight head close-up occupying most of the frame" | evidence_ref="full-body dog occupies a smaller portion of the frame"
+    I2 | A=No | evidence_target="pink poster background with headline text is clearly visible" | evidence_ref=""
+
+Local Edits:
+    I1 | action=rewrite | before="Smaller dog" | after="dog" | reason="target shows enlarged."
+    I2 | action=rewrite | before="no background" | after="on a pink background with text" | reason="background is pink with headline text"
+
+Generate Text_new:
+    text_new="dog on a pink background with text"
+
+<<<USER
+<Input>
+    "REFERENCE": <image_path>,
+    "TARGET": <image_path>,
+    "Input edit text": "Add two dogs."
+>>>ASSISTANT
+Generate Captions:
+    Reference: [REFERENCE] two white puppies are playing in the snow.
+    Target: [TARGET] Three white dogs are playing on a snowy field.
+
+Decompose Intents:
+    I1 | span="Add two dogs" | intent="add two dogs" | type=relative | objects=["dog"] | note="relative requirement"
+
+Generate Polar Questions:
+    I1 | scope=compare_ref_target | Q="Comparing REFERENCE and TARGET, does the TARGET image have two more dogs than the REFERENCE?"
+
+Answer Questions via Image Comparison:
+    I1 | A=No | evidence_target="three white dogs are playing on a snowy field" | evidence_ref="two white puppies are playing in the snow"
+
+Local Edits:
+    I1 | action=rewrite | before="Add two dogs" | after="Add a dog" | reason="target has one more dogs than REFERENCE"
+
+Generate Text_new:
+    text_new="Add a dog"
