@@ -1114,6 +1114,11 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             experiment_dir=self.args.output_dir
         )
 
+        # 先通过 CandidateBuilder 构建检索候选库
+        retrieval_candidates = candidate_builder.build()
+        print_master(f"CandidateBuilder built {len(retrieval_candidates)} retrieval candidates")
+
+
         # 🔧 关键修复：补齐 RetrievalEngine 必需参数
         retrieval_engine = RetrievalEngine(
             model_args=self.model_args,
