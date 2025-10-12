@@ -595,24 +595,23 @@ class CIRREvaluator:
             batch_names = image_names[i:i+self.batch_size]
             batch_images = [self._load_image(name) for name in batch_names]
             
-            # Use VLM2Vec's unified text processing
+            # 使用与 CIRR 训练集一致的目标编码指令
             from ..model.processor import process_input_text
-            
-            # Create image-only inputs for target encoding
-            texts = []
-            for _ in batch_images:
-                # Use empty text with image token for targets
-                target_text = process_input_text(
-                    instruction="", 
-                    model_backbone=self.model_backbone, 
-                    text="", 
-                    add_image_token=True
+            instruction = "Represent the given image in one word:"
+            texts = [
+                process_input_text(
+                    instruction=instruction,
+                    model_backbone=self.model_backbone,
+                    text="",
+                    add_image_token=True,
                 )
-                texts.append(target_text)
+                for _ in batch_images
+            ]
+            wrapped_images = [[img] for img in batch_images]
             
             batch_data = {
                 'text': texts,
-                'images': batch_images
+                'images': wrapped_images
             }
             
             # Use unified encoding function
@@ -640,23 +639,20 @@ class CIRREvaluator:
         for i in tqdm(range(0, len(queries), self.batch_size), desc=desc, disable=disable_tqdm):
             batch_queries = queries[i:i+self.batch_size]
             
-            # Prepare batch - use correct CIRR key names
-            batch_images = [self._load_image(q['reference']) for q in batch_queries]
+            # 与 CIRR 训练集一致：将 caption 嵌入到 instruction 中，text 传空串
+            batch_images_raw = [self._load_image(q['reference']) for q in batch_queries]
+            batch_images = [[img] for img in batch_images_raw]
             
-            # Use VLM2Vec's unified text processing
             from ..model.processor import process_input_text
-            
             batch_texts = []
             for q in batch_queries:
-                # Get instruction from config
-                instruction = self.eval_config.get('model', {}).get('instructions', {}).get('query_instruction', 
-                                                                                           'Represent the given image with the following modification')
-                # Create composed query text - use correct CIRR key name
+                cap = q.get('caption', '')
+                instruction = f"Modify this image with <{cap}>\nRepresent the modified image in one word:"
                 query_text = process_input_text(
-                    instruction=instruction, 
-                    model_backbone=self.model_backbone, 
-                    text=q['caption'], 
-                    add_image_token=True
+                    instruction=instruction,
+                    model_backbone=self.model_backbone,
+                    text="",
+                    add_image_token=True,
                 )
                 batch_texts.append(query_text)
             

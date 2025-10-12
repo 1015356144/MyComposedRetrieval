@@ -236,8 +236,8 @@ def load_model_and_processor(eval_args: CIRREvalArguments, model_args: ModelArgu
     # 备选分辨率（便于快速切换做对比测试）
     # data_args.resize_max_pixels = 35840   #  ~sqrt(35840)=189 (早期小分辨率/调试)
     # data_args.resize_max_pixels = 50176   # 224*224
-    data_args.resize_max_pixels = 82944   # 288*288
-    # data_args.resize_max_pixels = 147456  # 384*384
+    # data_args.resize_max_pixels = 82944   # 288*288
+    data_args.resize_max_pixels = 147456  # 384*384
     # data_args.resize_max_pixels = 262144  # 512*512 默认评测分辨率
     print_master(f"✅ Set max_len={data_args.max_len}, resize_max_pixels={data_args.resize_max_pixels}")
 
