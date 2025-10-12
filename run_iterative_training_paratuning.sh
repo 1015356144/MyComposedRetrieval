@@ -7,7 +7,7 @@
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 2
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 8
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 2 ./experiments/IterativeCIRR_qwen2vl_20250805_000011
-#
+#   bash ./run_iterative_training_paratuning.sh cirr qwen2_5vl_7b 1
 # Notes:
 # - This script uses LoRA with r=16, dropout=0.1 and (default) alpha=32 (override via $LORA_ALPHA).
 # - Iterative training with grouped-by-reference-image sampler remains enabled.
@@ -147,7 +147,7 @@ if (( NUM_GPUS > 1 )); then
     dataloader_workers=6
     cuda_devices="0,1,2,3"
   elif (( NUM_GPUS == 8 )); then
-    per_device_batch_size=11
+    per_device_batch_size=9
     gradient_accumulation=1
     dataloader_workers=8
     cuda_devices="0,1,2,3,4,5,6,7"

@@ -2,6 +2,7 @@
 import os
 import base64
 from openai import OpenAI
+# test 
 
 def encode_image_to_data_url(path: str) -> str:
     """把本地图片转成 data URL（无需对外可访问）"""

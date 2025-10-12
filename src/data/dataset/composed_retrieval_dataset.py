@@ -3113,7 +3113,7 @@ def cirr_data_prepare(batch_dict, *args, **kwargs):
 
 
 # Register the dataset class manually
-AutoPairDataset.registry["IterativeCIRRDataset"] = IterativeCIRRDataset
+# AutoPairDataset.registry["IterativeCIRRDataset"] = IterativeCIRRDataset
 
 
 def create_llava_prompt_enhanced(original_text: str, is_hard_negative_context: bool = False) -> str:
