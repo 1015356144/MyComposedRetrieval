@@ -61,9 +61,6 @@ runs/
 
 # Data files (large datasets)
 *.json
-!requirements.txt
-!src/prompt/qwen/fewshot_examples.txt
-!src/prompt/qwen/system_prompt.txt
 !configs/*.json
 !hard_negatives_iter_0.json  # Keep small example files
 *.jsonl
@@ -71,6 +68,8 @@ runs/
 *.tsv
 *.txt
 !requirements.txt
+!src/prompt/qwen/fewshot_examples.txt
+!src/prompt/qwen/system_prompt.txt
 !README.md
 !*.py
 
