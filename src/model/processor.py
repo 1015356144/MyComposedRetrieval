@@ -412,7 +412,7 @@ def Phi3V_process_fn(model_inputs: dict, processor, max_length=None):
 
 
 # ==== mRoPE 对齐检查工具 ====
-import torch
+# import torch
 
 # def _mrope_align_check_batch(batch_inputs, tokenizer, tag=""):
 #     """
@@ -542,22 +542,22 @@ def Qwen2_VL_process_fn(model_inputs: dict, processor: Qwen2VLProcessor, max_len
     inputs['pixel_values_videos'] = pixel_values_videos
     inputs['video_grid_thw'] = video_grid_thw
 
-    # === 修复开始：把 list[ (1,3) ] → (N,3) ===
-    def _stack_grids(grids_list):
-        elems = []
-        for g in grids_list:
-            if g is None:
-                continue
-            a = np.asarray(g)
-            a = a.reshape(-1, 3)           # (3,) / (1,3) / (k,3) 都标准化为 (k,3)
-            elems.append(a)
-        if len(elems) == 0:
-            return None
-        cat = np.concatenate(elems, axis=0)  # (N,3)
-        return torch.as_tensor(cat, dtype=torch.long)
+    # # === 修复开始：把 list[ (1,3) ] → (N,3) ===
+    # def _stack_grids(grids_list):
+    #     elems = []
+    #     for g in grids_list:
+    #         if g is None:
+    #             continue
+    #         a = np.asarray(g)
+    #         a = a.reshape(-1, 3)           # (3,) / (1,3) / (k,3) 都标准化为 (k,3)
+    #         elems.append(a)
+    #     if len(elems) == 0:
+    #         return None
+    #     cat = np.concatenate(elems, axis=0)  # (N,3)
+    #     return torch.as_tensor(cat, dtype=torch.long)
 
-    inputs['image_grid_thw'] = _stack_grids(image_grid_thw)
-    inputs['video_grid_thw'] = _stack_grids(video_grid_thw)
+    # inputs['image_grid_thw'] = _stack_grids(image_grid_thw)
+    # inputs['video_grid_thw'] = _stack_grids(video_grid_thw)
 
     # _mrope_align_check_batch(inputs, processor.tokenizer, tag="Qwen2_VL_process_fn")
     return inputs

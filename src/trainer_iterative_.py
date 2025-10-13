@@ -1343,6 +1343,8 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 if not hard_negatives:
                     print_master("⚠️ No hard negatives found, stopping early")
                     break
+                
+                # TODO: 添加基于FM的假负例的过滤，注意这个地方的代码只是负责调用接口来执行这个功能，功能的具体实现和其它步骤一样解耦到其它模块中
 
                 # 4) Caption 增广
                 caption_time = 0.0
@@ -1378,6 +1380,8 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     if total_time > 0:
                         rate = (len(hard_negatives) + len(augmented_samples)) / max(total_time, 1e-6)
                         print_master(f"  - Processing rate: {rate:.2f} samples/second")
+
+                # TODO: 进行生成后样本的进一步过滤，一个是基于字符匹配的快速过滤，另一个是基于FM的过滤。同样也是这里只负责调用接口，具体实现解耦到其它模块中
 
             # -----------------------
             # 最后的同步与状态落盘

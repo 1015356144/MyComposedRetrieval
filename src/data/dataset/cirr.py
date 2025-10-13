@@ -87,7 +87,9 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
             "neg_text": neg_text,
             "neg_image": self._load_image(ref_image_path),
             "global_dataset_name": "CIRR",
-            "reference_image": ref_image_path,  # for GroupedBatchSampler
+            # 关键：统一规范化 reference_image，确保与增强样本一致，从而能被 sampler 分到同一组
+            "reference_image": self._get_full_image_path(ref_image_path),
+            "is_augmented": False,
         }
 
     def _get_augmented_sample(self, idx: int) -> Dict[str, Any]:
@@ -95,8 +97,11 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
 
         model_backbone = getattr(self.model_args, "model_backbone", "qwen2_vl")
 
+        # 兼容不同的增广样本字段：优先使用 caption，否则回退到 modification_text
+        mod_text = sample.get("caption", sample.get("modification_text", ""))
+
         query_text = process_input_text(
-            instruction=f"Modify this image with <{sample['caption']}>\nRepresent the modified image in one word:",
+            instruction=f"Modify this image with <{mod_text}>\nRepresent the modified image in one word:",
             model_backbone=model_backbone,
             text="",
             add_image_token=True,
@@ -114,17 +119,20 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
             add_image_token=True,
         )
 
+        ref_path = self._get_full_image_path(sample["reference_image"])  # 规范化
+
         return {
             "query_text": query_text,
-            "query_image": self._load_image(sample["reference_image"]),
+            "query_image": self._load_image(ref_path),
             "pos_text": pos_text,
             "pos_image": self._load_image(sample["target_image"]),
             "neg_text": neg_text,
-            "neg_image": self._load_image(sample["reference_image"]),
+            "neg_image": self._load_image(ref_path),
             "global_dataset_name": "CIRR",
             "is_augmented": True,
             "original_mod_text": sample.get("original_mod_text", ""),
-            "reference_image": sample["reference_image"],
+            # 关键：与原始样本相同规则的规范化 reference_image，确保分组一致
+            "reference_image": ref_path,
         }
 
 

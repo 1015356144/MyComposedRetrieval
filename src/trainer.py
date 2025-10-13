@@ -170,6 +170,9 @@ class MMEBTrainer(Trainer):
                 world_size=self.args.world_size if self.is_ddp else 1,
                 rank=self.args.process_index if self.is_ddp else 0,
                 ref_key="reference_image",
+                # 调试开关：可通过 TrainingArguments 传入 sampler_debug / sampler_debug_max_batches
+                debug=bool(getattr(self.args, 'sampler_debug', True)),
+                debug_max_batches=int(getattr(self.args, 'sampler_debug_max_batches', 5)),
             )
 
         # 非分组路径：标准 DistributedSampler
