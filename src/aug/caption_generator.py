@@ -249,7 +249,7 @@ class CaptionGenerator:
                 # 降低输出噪声：rank0 全打，其他每 5 个批次打一次
                 if bidx % 5 == 1 or rank == 0:
                     if bidx > 1:
-                        elapsed = time.time() - start_time
+                        elapsed = time.time
                         avg_tpb = elapsed / (bidx - 1)
                         remain = total_batches - bidx + 1
                         eta = f"ETA {int((avg_tpb*remain)//60):02d}:{int((avg_tpb*remain)%60):02d}"
@@ -304,13 +304,13 @@ class CaptionGenerator:
         # 本地写文件
         local_file = os.path.join(tmp_dir, f"gpu_{rank}_samples.json")
         try:
-            with open(local_file, "w") as f:
-                json.dump({
-                    "rank": rank,
-                    "samples": local_aug,
-                    "count": len(local_aug),
-                    "timestamp": time.time()
-                }, f, indent=2)
+            # 原子写入，避免主进程读到半写文件
+            tmp_local = local_file + ".tmp"
+            with open(tmp_local, "w") as f:
+                json.dump(local_aug, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_local, local_file)
             print_rank(f"GPU {rank}: Saved {len(local_aug)} to {local_file}")
         except Exception as e:
             print_rank(f"GPU {rank}: Error saving local file: {e}")
@@ -323,61 +323,78 @@ class CaptionGenerator:
         if rank == 0:
             all_aug = [local_aug]  # include rank0
             for r in range(1, world_size):
-                fp = os.path.join(tmp_dir, f"gpu_{r}_samples.json")
                 try:
-                    if os.path.exists(fp):
-                        with open(fp, "r") as f:
-                            data = json.load(f)
-                        samples = data.get("samples", [])
-                        all_aug.append(samples)
-                        print_rank(f"GPU 0: Loaded {len(samples)} from GPU {r}")
-                    else:
-                        print_rank(f"GPU 0: Missing file for GPU {r}, append []")
-                        all_aug.append([])
+                    with open(os.path.join(tmp_dir, f"gpu_{r}_samples.json"), "r") as f:
+                        data = json.load(f)
+                    print_rank(f"GPU 0: Loaded {len(data)} from GPU {r}")
+                    all_aug.append(data)
                 except Exception as e:
-                    print_rank(f"GPU 0: Error reading GPU {r} file: {e}")
+                    print_rank(f"GPU 0: Error loading GPU {r} file: {e}; treat as empty")
                     all_aug.append([])
 
             merged = []
             for chunk in all_aug:
-                if chunk and isinstance(chunk, list):
-                    merged.extend(chunk)
-                    print_rank(f"GPU 0: merge chunk +{len(chunk)}")
+                merged.extend(chunk)
 
             # 过滤无效
             print_rank(f"GPU 0: Filtering {len(merged)} samples")
             merged = self.validator.filter_valid_samples(merged)
 
-            # 保存最终文件
+            # 保存最终文件（原子落盘）
             self._save_augmented_samples(merged)
             print_rank(f"✅ GPU 0: Saved {len(merged)} merged samples")
 
-            # 清理
-            try:
-                shutil.rmtree(tmp_dir)
-                print_rank(f"GPU 0: Cleaned tmp dir {tmp_dir}")
-                if os.path.exists(sync_dir):
-                    shutil.rmtree(sync_dir)
-                    print_rank(f"GPU 0: Cleaned sync dir {sync_dir}")
-            except Exception as e:
-                print_rank(f"GPU 0: Cleanup warning: {e}")
+            # 不在此处清理，等所有 rank 读取完成后再清理，避免部分 rank 仍在等待文件
+            print_rank(f"GPU 0: Final file written, waiting other ranks to read before cleanup")
 
         # ============ 全部 rank 等待最终文件 ============
         print_rank(f"GPU {rank}: Waiting final file")
         _wait_file(final_aug_file, rank, max_wait_s=36000)
 
-        # 全部 rank 读最终文件（保持一致）
+        # 全部 rank 读最终文件（保持一致，增加重试以避免看到替换瞬间）
         final_aug = []
         if os.path.exists(final_aug_file):
             try:
-                with open(final_aug_file, "r") as f:
-                    saved = json.load(f)
-                final_aug = self.validator.filter_valid_samples(saved.get("samples", []))
+                final_aug = _json_load_retry(final_aug_file, retries=5, delay=0.3)
+                print_rank(f"GPU {rank}: Remaining valid samples: {len(final_aug)}/{len(final_aug)}")
                 print_rank(f"GPU {rank}: Final loaded {len(final_aug)} samples")
             except Exception as e:
                 print_rank(f"GPU {rank}: Error loading final file: {e}")
         else:
             print_rank(f"GPU {rank}: Final file not found")
+
+        # 通知已读取完成：在 sync 目录写入 final_read 标记
+        try:
+            final_read_flag = os.path.join(sync_dir, f"gpu_{rank}_final_read.txt")
+            with open(final_read_flag, "w") as f:
+                f.write(f"GPU {rank} read final file at {time.time()}")
+        except Exception as e:
+            print_rank(f"GPU {rank}: Error writing final_read flag: {e}")
+
+        # 仅 rank0 等待所有读取标记后再清理临时目录
+        if rank == 0:
+            print_rank("GPU 0: Waiting all final_read flags before cleanup")
+            start = time.time()
+            while True:
+                all_ok = True
+                for r in range(world_size):
+                    if not os.path.exists(os.path.join(sync_dir, f"gpu_{r}_final_read.txt")):
+                        all_ok = False
+                        break
+                if all_ok:
+                    break
+                if time.time() - start > 36000:
+                    print_rank("GPU 0: ❌ Timeout waiting final_read flags, proceed to cleanup")
+                    break
+                time.sleep(2)
+            # 清理
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                shutil.rmtree(sync_dir, ignore_errors=True)
+                print_rank(f"GPU 0: Cleaned tmp dir {tmp_dir}")
+                print_rank(f"GPU 0: Cleaned sync dir {sync_dir}")
+            except Exception as e:
+                print_rank(f"GPU 0: Cleanup error: {e}")
 
         self.augmented_samples = final_aug
         print_rank(f"GPU {rank}: 🎯 Distributed caption generation completed: {len(final_aug)}")
@@ -387,7 +404,7 @@ class CaptionGenerator:
     #        公共方法
     # =========================
     def _save_augmented_samples(self, samples):
-        """保存增强样本（写下一轮编号）"""
+        """保存增强样本（写下一轮编号） — 使用原子替换避免读到半写文件"""
         next_iter = self.iteration_round + 1
         out_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{next_iter}.json")
         # 附带基础统计
@@ -399,15 +416,19 @@ class CaptionGenerator:
                 "avg_original_length": (sum(len(s.get("original_mod_text", "")) for s in samples) / len(samples)) if samples else 0,
                 "avg_generated_length": (sum(len(s.get("modification_text", "")) for s in samples) / len(samples)) if samples else 0,
                 "unique_reference_images": len(set(s.get("reference_image", "") for s in samples)),
-                "unique_target_images": len(set(s.get("target_image", "")) for s in samples),
+                "unique_target_images": len(set(s.get("target_image", "") for s in samples)),
             },
             "samples": samples
         }
-        # 落盘并强制 flush
-        with open(out_file, "w") as f:
+        # 原子落盘：写 tmp -> fsync -> replace
+        tmp_path = out_file + ".tmp"
+        out_dir = os.path.dirname(out_file)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(tmp_path, "w") as f:
             json.dump(summary, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
+        os.replace(tmp_path, out_file)
         print_rank(f"✅ Saved {len(samples)} samples to {out_file}")
 
 
@@ -481,3 +502,16 @@ def _wait_file(path, rank, max_wait_s=36000):
         if elapsed % 10 == 0 and elapsed > 0:
             print_rank(f"GPU {rank}: Waiting final file... {elapsed}s")
     print_rank(f"GPU {rank}: ❌ Timeout waiting final file {path}")
+
+
+def _json_load_retry(path: str, retries: int = 5, delay: float = 0.2):
+    """带重试的 JSON 读取，解决文件原子替换瞬间的可见性/缓存抖动"""
+    last_err = None
+    for i in range(retries):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            last_err = e
+            time.sleep(delay * (i + 1))
+    raise last_err

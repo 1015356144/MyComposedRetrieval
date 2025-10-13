@@ -4,11 +4,44 @@ import os, random
 from typing import List, Dict
 from PIL import Image
 import re, json, torch
+import time
 from src.utils import print_rank
 
 _THIS_DIR = os.path.dirname(__file__)
 _SYS_TXT = os.path.join(_THIS_DIR, "system_prompt.txt")
 _FS_TXT  = os.path.join(_THIS_DIR, "fewshot_examples.txt")
+
+# NEW: cache prompt texts to avoid repeated FS I/O under DDP and transient ENOENT
+_TEXT_CACHE: Dict[str, str] = {}
+
+def _read_text_retry(path: str, retries: int = 3, delay: float = 0.2) -> str:
+    last_err = None
+    for i in range(retries):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except (FileNotFoundError, OSError) as e:
+            last_err = e
+            time.sleep(delay * (i + 1))
+    raise last_err
+
+def _read_text_cached(path: str) -> str:
+    if path in _TEXT_CACHE and _TEXT_CACHE[path]:
+        return _TEXT_CACHE[path]
+    try:
+        content = _read_text_retry(path)
+        _TEXT_CACHE[path] = content
+        return content
+    except Exception as e:
+        print_rank(f"Warning: failed to read {path}: {e}. Using cached/empty content.")
+        return _TEXT_CACHE.get(path, "")
+
+# Try to warm up cache once; non-fatal if files temporarily unavailable
+try:
+    _TEXT_CACHE[_SYS_TXT] = _read_text_retry(_SYS_TXT)
+    _TEXT_CACHE[_FS_TXT] = _read_text_retry(_FS_TXT)
+except Exception as e:
+    print_rank(f"Note: prompt warmup skipped: {e}")
 
 # --------------------------
 # Prompt creators (kept API)
@@ -177,8 +210,8 @@ def prepare_qwen_inputs(ref_image, target_image, prompt: str, processor, device)
     - ref_image / target_image: PIL.Image.Image
     - prompt: string (usually original_text or create_qwen_prompt(...))
     """
-    system_prompt = _read_text(_SYS_TXT)
-    fewshot_raw   = _read_text(_FS_TXT)
+    system_prompt = _read_text_cached(_SYS_TXT)
+    fewshot_raw   = _read_text_cached(_FS_TXT)
     fewshots = _parse_fewshot(fewshot_raw)
 
     input_text = _STAGES_TEMPLATE.format(modification_text=prompt)
