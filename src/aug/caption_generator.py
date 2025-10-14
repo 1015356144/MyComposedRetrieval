@@ -249,7 +249,7 @@ class CaptionGenerator:
                 # 降低输出噪声：rank0 全打，其他每 5 个批次打一次
                 if bidx % 5 == 1 or rank == 0:
                     if bidx > 1:
-                        elapsed = time.time
+                        elapsed = time.time() - start_time
                         avg_tpb = elapsed / (bidx - 1)
                         remain = total_batches - bidx + 1
                         eta = f"ETA {int((avg_tpb*remain)//60):02d}:{int((avg_tpb*remain)%60):02d}"
