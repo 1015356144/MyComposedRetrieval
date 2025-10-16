@@ -780,10 +780,10 @@ if __name__ == "__main__":
 
 # 基础运行命令
 accelerate launch --num_processes 8 text_split.py \
-    --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2.5-VL-7B-Instruct \
-    --json_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/retrieval_results/checkpoint-1500_20250919_160740/cirr_retrieval_top10.json \
+    --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2.5-VL-32B-Instruct \
+    --json_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/cirr_retrieval_top10.json \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
-    --output_file R1_49_2_5_7b_decomposed_results_2.json \
+    --output_file R1_54_2_5_32b_decomposed_results.json \
     --batch_size 2
 
 # 如果内存充足可以增大批处理大小
