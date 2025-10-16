@@ -5,6 +5,7 @@
 
 # use: ./eval_cirr.sh --model_path <path_to_model> --output_file <path_to_output>
 # ./eval_cirr.sh --model_path ./experiments/IterativeCIRR_qwen2vl_20250911_110310_copy --output_file ./results/eval_results_lora_paratuning.json
+# bash ./eval_cirr.sh --model_path ./experiments/IterativeCIRR_qwen2_5vl_7b_20251012_004205_copy_use_only_new_sample_test/training_iter_1/checkpoint-500 --output_file ./results/qwen2_5vl/eval_results_iter1_bs9_maxp384_384_prompt_use_only_new_sample_test.json
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
