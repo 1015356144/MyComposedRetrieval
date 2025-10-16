@@ -608,25 +608,29 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             dist.barrier()
             print_master("All GPUs synchronized after augmented samples save")
 
-        # 3) 将增广样本追加进当前训练集（数据集本身只负责取样，不做检索/挖掘）
-        #    为兼容你现有的数据集类型，做一次类型判断
+        # 3) 将增广样本追加进当前训练集
         try:
             ds_types = (IterativeCIRRDataset, IterativeFashionIQDataset)
         except Exception:
-            ds_types = tuple()  # 避免导入问题导致崩溃
+            ds_types = tuple()
 
         if isinstance(self.train_dataset, ds_types) or hasattr(self.train_dataset, "augmented_samples"):
-            # 记录更新前的规模
             old_total = len(self.train_dataset)
             old_aug = len(getattr(self.train_dataset, "augmented_samples", []))
 
-            # 标注轮次并追加样本
             setattr(self.train_dataset, "iteration_round", next_iteration)
             if not hasattr(self.train_dataset, "augmented_samples"):
                 self.train_dataset.augmented_samples = []
             self.train_dataset.augmented_samples.extend(augmented_samples)
 
-            # 兼容：很多下游代码会读这个路径（虽然现在挖掘已解耦）
+            # 参数控制：如果指定仅使用增广数据（且迭代>0）
+            use_original = getattr(self.args, "use_original_data_in_iter_plus", True)
+            if not use_original and next_iteration > 0 and hasattr(self.train_dataset, "set_use_original_data"):
+                self.train_dataset.set_use_original_data(False)
+                print_master(f"🔥 Iter {next_iteration}: Using ONLY augmented samples (original disabled)")
+            elif hasattr(self.train_dataset, "set_use_original_data"):
+                self.train_dataset.set_use_original_data(True)
+
             setattr(
                 self.train_dataset,
                 "hard_negatives_file",
@@ -635,16 +639,14 @@ class IterativeRetrievalTrainer(MMEBTrainer):
 
             new_total = len(self.train_dataset)
             new_aug = len(self.train_dataset.augmented_samples)
-
             print_master("📊 Dataset update summary:")
             print_master(f"  - Added {len(augmented_samples)} new augmented samples")
             print_master(f"  - Total augmented samples: {old_aug} → {new_aug}")
-            print_master(f"  - Total dataset size: {old_total} → {new_total}")
+            # 真实 total 需视 use_original_data 标志而定，此处打印逻辑长度
+            print_master(f"  - Reported dataset length (len(dataset)): {new_total}")
         else:
-            # 极端情况下（自定义数据集对象），只做日志提醒；训练仍可继续
             print_master("⚠️ Train dataset has no 'augmented_samples' attribute; skipped in-memory append.")
 
-        # 4) 关键：重建 dataloader，确保采样器与 batch 逻辑按最新样本数工作
         self._update_train_dataloader()
         print_master(f"Training dataloader updated for iteration {next_iteration}")
 
@@ -807,16 +809,84 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 print_master(f"Warning: failed to read {augmented_file}: {e}")
                 continue
 
-            # 兼容两种格式：新(带metadata) & 旧(直接list)
+            # 兼容多种格式：新(带metadata)、旧(直接list)、以及误写的嵌套结构
+            iter_samples = None
+            declared_total = data.get("total_samples") if isinstance(data, dict) else None
+
             if isinstance(data, dict) and "samples" in data:
                 iter_samples = data["samples"]
+                # 情况 A: 正常 list
+                if isinstance(iter_samples, list):
+                    pass
+                # 情况 B: samples 是 dict
+                elif isinstance(iter_samples, dict):
+                    # B1: 内层还是 meta，含有真正的 list
+                    if "samples" in iter_samples and isinstance(iter_samples["samples"], list):
+                        iter_samples = iter_samples["samples"]
+                        print_master(
+                            f"Note: iter {i} 'samples' contained nested 'samples' list; unwrapped to list with {len(iter_samples)} items"
+                        )
+                    # B2: 纯 id->sample 的 dict
+                    elif all(isinstance(v, dict) for v in iter_samples.values()):
+                        iter_samples = list(iter_samples.values())
+                        print_master(
+                            f"Note: iter {i} 'samples' is a dict with {len(iter_samples)} dict values; converted to list"
+                        )
+                    else:
+                        # B3: 可能是 id->list[...] 混合，挑最长的 list 作为样本列表
+                        list_candidates = [v for v in iter_samples.values() if isinstance(v, list)]
+                        if list_candidates:
+                            best = max(list_candidates, key=len)
+                            iter_samples = best
+                            print_master(
+                                f"Note: iter {i} 'samples' dict had list candidates; selected longest list with {len(iter_samples)} items"
+                            )
+                        else:
+                            # B4: 没有 list 候选，退化为 values 列表
+                            iter_samples = list(iter_samples.values())
+                            print_master(
+                                f"Note: iter {i} 'samples' dict coerced to list of values (len={len(iter_samples)}); will filter non-dict entries"
+                            )
+                else:
+                    # 其它可迭代类型，尝试转 list
+                    try:
+                        iter_samples = list(iter_samples)
+                        print_master(
+                            f"Note: iter {i} 'samples' of type {type(data['samples']).__name__} coerced to list with {len(iter_samples)} items"
+                        )
+                    except Exception:
+                        print_master(
+                            f"Warning: Unexpected 'samples' type in {augmented_file}: {type(data['samples']).__name__}; skip"
+                        )
+                        continue
                 print_master(f"Loaded {len(iter_samples)} augmented samples from iter {i} (with metadata)")
             elif isinstance(data, list):
                 iter_samples = data
                 print_master(f"Loaded {len(iter_samples)} augmented samples from iter {i} (direct list)")
+            elif isinstance(data, dict) and all(isinstance(v, dict) for v in data.values()):
+                # 顶层就是 dict-of-samples 的容错
+                iter_samples = list(data.values())
+                print_master(
+                    f"Detected top-level dict-of-samples for iter {i}; converted to list with {len(iter_samples)} items"
+                )
             else:
                 print_master(f"Warning: Unexpected data format in {augmented_file}, skip")
                 continue
+
+            # 进一步过滤：仅保留字典样本，避免统计时访问 .get 报错
+            if not isinstance(iter_samples, list):
+                print_master(f"Warning: iter {i} samples not a list after coercion; skip")
+                continue
+            before = len(iter_samples)
+            iter_samples = [s for s in iter_samples if isinstance(s, dict)]
+            dropped = before - len(iter_samples)
+            if dropped > 0:
+                print_master(f"Note: iter {i} dropped {dropped} non-dict entries while loading augmented samples")
+
+            if declared_total is not None and isinstance(declared_total, int) and declared_total != len(iter_samples):
+                print_master(
+                    f"Consistency check: iter {i} meta total_samples={declared_total}, loaded={len(iter_samples)}"
+                )
 
             all_augmented_samples.extend(iter_samples)
 
@@ -840,8 +910,24 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         if isinstance(self.train_dataset, (IterativeCIRRDataset, IterativeFashionIQDataset)):
             # 标注当前轮次
             self.train_dataset.iteration_round = iteration
-            # 覆盖为累计的增广样本列表
+            
+            # 修正：不清空，直接使用加载的 all_augmented_samples
             self.train_dataset.augmented_samples = all_augmented_samples
+
+            # 根据参数决定是否在迭代 > 0 时使用原始数据
+            use_original = getattr(self.args, "use_original_data_in_iter_plus", True)
+            if not use_original and iteration > 0:
+                print_master(f"🔥 Iteration {iteration}: Using ONLY augmented data as per `use_original_data_in_iter_plus=False`.")
+                # 通过设置一个标志位来禁用原始数据
+                if hasattr(self.train_dataset, "set_use_original_data"):
+                    self.train_dataset.set_use_original_data(False)
+                else:
+                    print_master("⚠️  Warning: Dataset does not support `set_use_original_data`. Original data might still be used.")
+            else:
+                if hasattr(self.train_dataset, "set_use_original_data"):
+                    self.train_dataset.set_use_original_data(True)
+                    # 强制刷新数据集内部状态
+                    self.train_dataset.num_rows = len(self.train_dataset)
 
             # 兼容字段：有些下游代码可能还会读这个路径
             if hasattr(self.train_dataset, "hard_negatives_file"):
@@ -1344,7 +1430,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     print_master("⚠️ No hard negatives found, stopping early")
                     break
                 
-                # TODO: 添加基于FM的假负例的过滤，注意这个地方的代码只是负责调用接口来执行这个功能，功能的具体实现和其它步骤一样解耦到其它模块中
+                # TODO: 添加基于FM的假负例的过滤，注意这个地方的代码只是负责调用接口来执行这个功能，功能的具体实现和其它步骤一模一样解耦到其它模块中
 
                 # 4) Caption 增广
                 caption_time = 0.0
