@@ -70,6 +70,37 @@ class CaptionGenerator:
         mapped = self.image_splits.get(p, p)
         return get_full_image_path(mapped, self.image_base_dir)
 
+    # ===== NEW: 规范化从磁盘读取的增广文件（无论是否嵌套）为 List[Dict] =====
+    def _coerce_saved_samples(self, saved: dict) -> list:
+        if not isinstance(saved, dict):
+            return []
+        samples = saved.get("samples", [])
+        # nested meta dict
+        if isinstance(samples, dict):
+            # case 1: inner meta with 'samples' list
+            inner = samples.get("samples") if isinstance(samples, dict) else None
+            if isinstance(inner, list):
+                return [s for s in inner if isinstance(s, dict)]
+            # case 2: dict-of-samples
+            if all(isinstance(v, dict) for v in samples.values()):
+                return list(samples.values())
+            # case 3: pick longest list in values
+            lists = [v for v in samples.values() if isinstance(v, list)]
+            if lists:
+                best = max(lists, key=len)
+                return [s for s in best if isinstance(s, dict)]
+            # fallback: values that are dicts
+            return [v for v in samples.values() if isinstance(v, dict)]
+        # plain list
+        if isinstance(samples, list):
+            return [s for s in samples if isinstance(s, dict)]
+        # other iterable
+        try:
+            ls = list(samples)
+            return [s for s in ls if isinstance(s, dict)]
+        except Exception:
+            return []
+
     def _normalize_item_paths(self, item: dict) -> dict:
         out = dict(item)
         if "reference_image" in out:
@@ -98,8 +129,10 @@ class CaptionGenerator:
             try:
                 with open(aug_file, "r") as f:
                     saved = json.load(f)
-                samples = saved.get("samples", [])
-                samples = self.validator.filter_valid_samples(samples)
+                samples = self._coerce_saved_samples(saved)
+                declared = saved.get("total_samples") if isinstance(saved, dict) else None
+                if isinstance(declared, int) and declared != len(samples):
+                    print_rank(f"Loaded {len(samples)} samples (declared {declared}) — coerced")
                 self.augmented_samples = samples
                 return samples
             except Exception as e:
@@ -209,7 +242,10 @@ class CaptionGenerator:
             try:
                 with open(final_aug_file, "r") as f:
                     saved = json.load(f)
-                samples = self.validator.filter_valid_samples(saved.get("samples", []))
+                samples = self._coerce_saved_samples(saved)
+                declared = saved.get("total_samples") if isinstance(saved, dict) else None
+                if isinstance(declared, int) and declared != len(samples):
+                    print_rank(f"Loaded {len(samples)} samples (declared {declared}) — coerced")
                 self.augmented_samples = samples
                 return samples
             except Exception as e:
@@ -355,9 +391,14 @@ class CaptionGenerator:
         final_aug = []
         if os.path.exists(final_aug_file):
             try:
-                final_aug = _json_load_retry(final_aug_file, retries=5, delay=0.3)
-                print_rank(f"GPU {rank}: Remaining valid samples: {len(final_aug)}/{len(final_aug)}")
-                print_rank(f"GPU {rank}: Final loaded {len(final_aug)} samples")
+                saved = _json_load_retry(final_aug_file, retries=5, delay=0.3)
+                samples = self._coerce_saved_samples(saved) if isinstance(saved, dict) else []
+                declared = saved.get("total_samples", None) if isinstance(saved, dict) else None
+                final_aug = samples
+                if declared is not None and declared != len(samples):
+                    print_rank(f"GPU {rank}: Loaded {len(samples)} samples (declared {declared}) — coerced")
+                else:
+                    print_rank(f"GPU {rank}: Loaded {len(samples)} samples")
             except Exception as e:
                 print_rank(f"GPU {rank}: Error loading final file: {e}")
         else:
@@ -405,6 +446,13 @@ class CaptionGenerator:
     # =========================
     def _save_augmented_samples(self, samples):
         """保存增强样本（写下一轮编号） — 使用原子替换避免读到半写文件"""
+        # 防呆：确保 samples 为 List[Dict]
+        if not isinstance(samples, list):
+            samples = self._coerce_saved_samples({"samples": samples}) if hasattr(self, "_coerce_saved_samples") else []
+        else:
+            # 过滤非 dict 项
+            samples = [s for s in samples if isinstance(s, dict)]
+
         next_iter = self.iteration_round + 1
         out_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{next_iter}.json")
         # 附带基础统计
@@ -425,7 +473,7 @@ class CaptionGenerator:
         out_dir = os.path.dirname(out_file)
         os.makedirs(out_dir, exist_ok=True)
         with open(tmp_path, "w") as f:
-            json.dump(summary, f, indent=2)
+            json.dump(summary, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, out_file)
