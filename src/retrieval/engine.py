@@ -139,13 +139,52 @@ class RetrievalEngine:
         # GT 索引（fallback -1）
         target_paths = candidate_targets
         gt_indices = []
-        for q in batch:
+        gt_full_ranks = []  # ✅ 新增：GT 在全库中的绝对名次（1-based）；若不在候选库为 -1
+        gt_similarities = []  # ✅ 新增：GT 相似度（若不在候选库则为 None）
+        # 新增：当找不到 GT 时，打印规范化对比结果
+        abs_candidate_paths_norm = None  # type: ignore
+        cand_norm_set = None  # type: ignore
+        cand_norm_index = None  # type: ignore
+        for i, q in enumerate(batch):
             gt_path_raw = q["target_image"]
             gt_abs = get_full_image_path(gt_path_raw, self.image_base_dir)
             try:
                 gt_idx = abs_candidate_paths.index(gt_abs)
+                # 计算全库绝对名次（1-based）：比 GT 相似度更大的数量 + 1
+                gt_sim = sims[i, gt_idx].item()
+                full_rank = int(1 + torch.sum(sims[i] > sims[i, gt_idx]).item())
+                gt_full_ranks.append(full_rank)
+                gt_similarities.append(gt_sim)
             except ValueError:
+                # 调试：仅在失败时构建规范化候选集并对比
+                try:
+                    gt_norm = os.path.normpath(os.path.realpath(gt_abs))
+                    if abs_candidate_paths_norm is None:
+                        abs_candidate_paths_norm = [os.path.normpath(os.path.realpath(p)) for p in abs_candidate_paths]
+                        cand_norm_set = set(abs_candidate_paths_norm)
+                        cand_norm_index = {p: i for i, p in enumerate(abs_candidate_paths_norm)}
+                    if gt_norm in cand_norm_set:  # type: ignore[arg-type]
+                        norm_idx = cand_norm_index.get(gt_norm, -1)  # type: ignore[union-attr]
+                        print_rank(
+                            f"DEBUG[retrieval]: GT raw not found, but found after normalization at idx={norm_idx}.\n"
+                            f"  gt_raw={gt_path_raw}\n  gt_abs={gt_abs}\n  gt_norm={gt_norm}"
+                        )
+                    else:
+                        # 打印最小必要信息，避免过多日志
+                        sample_cand = abs_candidate_paths[0] if len(abs_candidate_paths) > 0 else ""
+                        sample_cand_norm = (
+                            abs_candidate_paths_norm[0] if abs_candidate_paths_norm and len(abs_candidate_paths_norm) > 0 else ""
+                        )
+                        print_rank(
+                            "DEBUG[retrieval]: GT not in candidate set even after normalization. "
+                            f"num_candidates={len(abs_candidate_paths)}\n  gt_raw={gt_path_raw}\n  gt_abs={gt_abs}\n  gt_norm={gt_norm}\n"
+                            f"  sample_cand_abs={sample_cand}\n  sample_cand_norm={sample_cand_norm}"
+                        )
+                except Exception as e:
+                    print_rank(f"DEBUG[retrieval]: normalization diagnostic failed: {e}")
                 gt_idx = -1
+                gt_full_ranks.append(-1)
+                gt_similarities.append(None)
             gt_indices.append(gt_idx)
 
         results = {
@@ -153,6 +192,9 @@ class RetrievalEngine:
             "gt_indices": gt_indices,
             "similarities": top_k_sims.tolist(),
             "target_paths": target_paths,
+            # ✅ 新增
+            "gt_full_ranks": gt_full_ranks,
+            "gt_similarities": gt_similarities,
         }
 
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -210,13 +252,49 @@ class RetrievalEngine:
         top_k_sims, top_k_idx = torch.topk(sims, k, dim=1, largest=True)
 
         gt_indices = []
-        for q in batch:
+        gt_full_ranks = []  # ✅ 新增
+        gt_similarities = []  # ✅ 新增
+        # 新增：当找不到 GT 时，打印规范化对比结果
+        abs_candidate_paths_norm = None  # type: ignore
+        cand_norm_set = None  # type: ignore
+        cand_norm_index = None  # type: ignore
+        for i, q in enumerate(batch):
             gt_path_raw = q["target_image"]
             gt_abs = get_full_image_path(gt_path_raw, self.image_base_dir)
             try:
                 gt_idx = abs_candidate_paths.index(gt_abs)
+                gt_sim = sims[i, gt_idx].item()
+                full_rank = int(1 + torch.sum(sims[i] > sims[i, gt_idx]).item())
+                gt_full_ranks.append(full_rank)
+                gt_similarities.append(gt_sim)
             except ValueError:
+                try:
+                    gt_norm = os.path.normpath(os.path.realpath(gt_abs))
+                    if abs_candidate_paths_norm is None:
+                        abs_candidate_paths_norm = [os.path.normpath(os.path.realpath(p)) for p in abs_candidate_paths]
+                        cand_norm_set = set(abs_candidate_paths_norm)
+                        cand_norm_index = {p: i for i, p in enumerate(abs_candidate_paths_norm)}
+                    if gt_norm in cand_norm_set:  # type: ignore[arg-type]
+                        norm_idx = cand_norm_index.get(gt_norm, -1)  # type: ignore[union-attr]
+                        print_rank(
+                            f"DEBUG[retrieval_cached]: GT raw not found, but found after normalization at idx={norm_idx}.\n"
+                            f"  gt_raw={gt_path_raw}\n  gt_abs={gt_abs}\n  gt_norm={gt_norm}"
+                        )
+                    else:
+                        sample_cand = abs_candidate_paths[0] if len(abs_candidate_paths) > 0 else ""
+                        sample_cand_norm = (
+                            abs_candidate_paths_norm[0] if abs_candidate_paths_norm and len(abs_candidate_paths_norm) > 0 else ""
+                        )
+                        print_rank(
+                            "DEBUG[retrieval_cached]: GT not in candidate set even after normalization. "
+                            f"num_candidates={len(abs_candidate_paths)}\n  gt_raw={gt_path_raw}\n  gt_abs={gt_abs}\n  gt_norm={gt_norm}\n"
+                            f"  sample_cand_abs={sample_cand}\n  sample_cand_norm={sample_cand_norm}"
+                        )
+                except Exception as e:
+                    print_rank(f"DEBUG[retrieval_cached]: normalization diagnostic failed: {e}")
                 gt_idx = -1
+                gt_full_ranks.append(-1)
+                gt_similarities.append(None)
             gt_indices.append(gt_idx)
 
         return {
@@ -224,6 +302,9 @@ class RetrievalEngine:
             "gt_indices": gt_indices,
             "similarities": top_k_sims.tolist(),
             "target_paths": candidate_targets,
+            # ✅ 新增
+            "gt_full_ranks": gt_full_ranks,
+            "gt_similarities": gt_similarities,
         }
 
     # -------------------------- internal: inputs & utils --------------------------
@@ -232,15 +313,16 @@ class RetrievalEngine:
         self, target_paths: List[str], processor: Any, model_backbone: str, device: torch.device
     ) -> Dict[str, torch.Tensor]:
         """
-        与你原来的 _prepare_target_inputs 等价：为 target 图像构建“仅图像+轻文本”的输入
+        与训练数据集一致：为 target 图像构建“仅图像 + one-word 提示”的输入
         """
         if process_input_text is None:
             raise RuntimeError("process_input_text is not available. Please ensure prompts.builder is installed.")
 
         texts: List[str] = []
         for _ in target_paths:
+            # 与 IterativeCIRRDataset/_get_original_sample 中的 pos_text 对齐
             t = process_input_text(
-                instruction="Represent the given image",
+                instruction="Represent the given image in one word:",
                 model_backbone=model_backbone,
                 text="",
                 add_image_token=True,
@@ -253,7 +335,7 @@ class RetrievalEngine:
         self, batch: List[Dict[str, Any]], processor: Any, model_backbone: str, device: torch.device
     ) -> Dict[str, torch.Tensor]:
         """
-        与你原来的 _prepare_query_inputs 等价：为查询（参考图 + 修改文本）构建输入
+        与训练数据集一致：为查询（参考图 + 修改文本）构建输入
         """
         if process_input_text is None:
             raise RuntimeError("process_input_text is not available. Please ensure prompts.builder is installed.")
@@ -261,10 +343,12 @@ class RetrievalEngine:
         image_paths = [q["reference_image"] for q in batch]
         texts: List[str] = []
         for q in batch:
+            # 与 IterativeCIRRDataset/_get_original_sample 和 _get_augmented_sample 的 query_text 对齐
+            mod_text = q.get("modification_text", "")
             txt = process_input_text(
-                instruction="Represent the given image with the following modification",
+                instruction=f"Modify this image with <{mod_text}>\nRepresent the modified image in one word:",
                 model_backbone=model_backbone,
-                text=q["modification_text"],
+                text="",
                 add_image_token=True,
             )
             texts.append(txt)

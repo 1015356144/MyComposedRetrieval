@@ -297,6 +297,8 @@ class HardNegativeMiner:
 
         target_paths = retrieval_results.get('target_paths', None)
         is_real_retrieval = target_paths is not None
+        gt_full_ranks = retrieval_results.get('gt_full_ranks')  # List[int] or None
+        gt_sim_list = retrieval_results.get('gt_similarities')  # List[float|None] or None
 
         for qidx, (query, gt_target, top_k, sims) in enumerate(
             zip(batch, gt_indices, top_k_indices, similarities)
@@ -304,6 +306,11 @@ class HardNegativeMiner:
             # 🔥 关键：过滤掉参考图本身
             query_ref_path = query['reference_image']
             filtered_hard_negatives = []
+
+            # 计算 top-k 内 GT 的名次（1-based），仅用于显示；真实绝对名次从 engine 提供
+            gt_topk_rank = -1
+            if gt_target in top_k:
+                gt_topk_rank = int(top_k.index(gt_target) + 1)
 
             def process_negative_candidate(neg_pos: int,
                                            neg_idx: int,
@@ -330,6 +337,11 @@ class HardNegativeMiner:
                     print_rank(f"Filtered out ground truth as hard negative: {hard_negative_image}")
                     return False
 
+                # 真实绝对名次与相似度
+                full_rank = gt_full_ranks[qidx] if isinstance(gt_full_ranks, list) and qidx < len(gt_full_ranks) else -1
+                gt_sim = gt_sim_list[qidx] if isinstance(gt_sim_list, list) and qidx < len(gt_sim_list) else None
+                gt_in_candidates = (gt_target != -1)
+
                 # 通过过滤，加到列表
                 filtered_hard_negatives.append({
                     'reference_image': query['reference_image'],
@@ -337,7 +349,11 @@ class HardNegativeMiner:
                     'target_image': query['target_image'],  # GT
                     'hard_negative_image': hard_negative_image,
                     'rank_position': int(neg_pos + 1),
-                    'gt_rank': int(gt_position + 1) if gt_position >= 0 else -1,
+                    # ✅ 改：JSON 中的 gt_rank 表示全库绝对名次（1-based）；保留 topk 名次单独字段
+                    'gt_rank': int(full_rank),
+                    'gt_topk_rank': int(gt_topk_rank),
+                    'gt_in_candidates': bool(gt_in_candidates),
+                    'gt_similarity': float(gt_sim) if gt_sim is not None else None,
                     'similarity_score': float(sims[neg_pos]) if neg_pos < len(sims) else 0.0,
                     'is_real_retrieval': is_real_retrieval
                 })
