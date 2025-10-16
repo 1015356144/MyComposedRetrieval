@@ -57,6 +57,9 @@ class TrainingArguments(TrainingArguments):
     group_by_reference_image: bool = field(
         default=False, metadata={"help": "Group samples by reference image into the same batch during iterative training."}
     )
+    use_original_data_in_iter_plus: bool = field(
+        default=True, metadata={"help": "Whether to use original data in iterations > 0. If False, only augmented data will be used."}
+    )
     # evaluation_strategy: str = field(default='no', metadata={"help": "The evaluation strategy to adopt during training. Possible values are: 'no', 'steps', 'epoch'"})
     # per_device_train_batch_size: int = field(default=8, metadata={"help": "The batch size per GPU/TPU core/CPU for training."})
     image_encoder_freeze: bool = field(default=False, metadata={"help": "huggingface model name"})
@@ -75,6 +78,7 @@ class TrainingArguments(TrainingArguments):
     max_iterations: int = field(default=3, metadata={"help": "Maximum number of iterative training rounds"})
     hard_neg_collection_freq: int = field(default=1, metadata={"help": "Frequency of hard negative collection (every N iterations)"})
     caption_generation_batch_size: int = field(default=8, metadata={"help": "Batch size for foundation model caption generation"})
+
 
 @dataclass
 class MTEBArguments:

@@ -19,6 +19,36 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
     Iterative CIRR Dataset (data loading + sample building).
     Retrieval/mining/augmentation are handled by dedicated modules outside.
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_original_data = True
+
+    def set_use_original_data(self, use_original: bool):
+        """Set whether to use original data or only augmented data."""
+        self.use_original_data = use_original
+        # Recalculate total number of rows
+        self.num_rows = self.__len__()
+        print_rank(f"Dataset config updated: use_original_data = {self.use_original_data}. Total samples = {self.num_rows}")
+
+    def __len__(self):
+        """Return the total number of samples in the dataset."""
+        if not self.use_original_data:
+            return len(self.augmented_samples)
+        return len(self.annotations) + len(self.augmented_samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get a sample from the dataset."""
+        if not self.use_original_data:
+            # Only use augmented samples
+            if idx >= len(self.augmented_samples):
+                raise IndexError("Index out of range when only using augmented samples")
+            return self._get_augmented_sample(idx)
+
+        # Use both original and augmented samples
+        if idx < len(self.annotations):
+            return self._get_original_sample(idx)
+        else:
+            return self._get_augmented_sample(idx - len(self.annotations))
 
     # ---------- Dataset-specific loading ----------
     def _load_data(self) -> None:
