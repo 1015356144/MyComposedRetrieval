@@ -2,7 +2,7 @@ import json
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from PIL import Image
 import os
 from tqdm import tqdm
@@ -480,7 +480,7 @@ def main():
     parser = argparse.ArgumentParser(description='Rerank retrieval results using Qwen2VL with decomposed modifications')
     parser.add_argument('--model_dir', type=str, required=True, help='Path to Qwen2VL model directory')
     parser.add_argument('--json_file', type=str, 
-                       default='/home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/R1_49_2_5_7b_decomposed_results_2.json', 
+                       default='/home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/R1_54_2_5_32b_decomposed_results.json', 
                        help='Path to input JSON file with decomposed modifications')
     parser.add_argument('--image_dir', type=str, required=True, help='Path to image directory')
     parser.add_argument('--output_file', type=str, default='decomposed_reranked_results.json', help='Output JSON file')
@@ -705,7 +705,7 @@ if __name__ == "__main__":
 运行命令示例:
 
 # 处理所有query (默认使用算术平均值聚合)
-accelerate launch --num_processes 8 VQA_rerank_decomposed.py \
+accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
     --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2.5-VL-32B-Instruct \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
     --output_file decomposed_reranked_results.json \
@@ -713,16 +713,16 @@ accelerate launch --num_processes 8 VQA_rerank_decomposed.py \
     --max_image_size 768
 
 # 使用几何平均值聚合
-accelerate launch --num_processes 8 VQA_rerank_decomposed.py \
-    --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-7B-Instruct \
+accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
+    --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2.5-VL-7B-Instruct \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
-    --output_file decomposed_reranked_results_geometric.json \
+    --output_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/results/qwen25_7b/R1_54/decomposed_reranked_results_geometric.json \
     --batch_size 2 \
-    --max_image_size 768 \
+    --max_image_size 1440 \
     --aggregation_mode geometric
 
 # 使用调和平均值聚合
-accelerate launch --num_processes 8 VQA_rerank_decomposed.py \
+accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
     --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-7B-Instruct \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
     --output_file decomposed_reranked_results_harmonic.json \
@@ -731,7 +731,7 @@ accelerate launch --num_processes 8 VQA_rerank_decomposed.py \
     --aggregation_mode harmonic
 
 # 只处理前100个query进行测试
-accelerate launch --num_processes 8 VQA_rerank_decomposed.py \
+accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
     --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-7B-Instruct \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
     --output_file decomposed_reranked_results_test.json \
@@ -750,7 +750,7 @@ accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
     --aggregation_mode geometric
 
 # 使用单进程版本并指定使用最小值聚合
-python VQA_rerank_decomposed.py \
+python VQA_rerank_decomposed2_5.py \
     --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-7B-Instruct \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
     --output_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/results/decomposed_reranked_results_min.json \

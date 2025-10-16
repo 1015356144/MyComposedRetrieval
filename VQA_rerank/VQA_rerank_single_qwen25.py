@@ -538,9 +538,9 @@ if __name__ == "__main__":
 # 最稳定：单样本处理，不使用Flash Attention
 accelerate launch --num_processes 8 VQA_rerank_single_qwen25.py \
     --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2.5-VL-32B-Instruct \
-    --json_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/retrieval_results/checkpoint-1500_20250919_160740/cirr_retrieval_top10.json \
+    --json_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/cirr_retrieval_top10.json \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
-    --output_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/results/qwen25_32b/R1_49/reranked_results1_qwen25_32b.json \
+    --output_file /home/guohaiyun/yangtianyu/MyComposedRetrieval/VQA_rerank/results/qwen25_7b/R1_54/reranked_results1_qwen25_32b_single.json \
     --batch_size 4 \
     --max_image_size 2048
 
