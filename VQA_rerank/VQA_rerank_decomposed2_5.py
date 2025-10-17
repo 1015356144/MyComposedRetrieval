@@ -732,7 +732,7 @@ accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
 
 # 只处理前100个query进行测试
 accelerate launch --num_processes 8 VQA_rerank_decomposed2_5.py \
-    --model_dir /home/guohaiyun/yangtianyu/CPRCIR/checkpoints/hf_models/Qwen2-VL-7B-Instruct \
+    --model_dir  \
     --image_dir /home/guohaiyun/yty_data/CIRR/dev \
     --output_file decomposed_reranked_results_test.json \
     --batch_size 2 \

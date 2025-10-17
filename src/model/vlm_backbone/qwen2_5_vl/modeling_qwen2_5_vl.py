@@ -1604,22 +1604,20 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     else:
                         ed_video = len(input_tokens) + 1
                     if ed_image < ed_video:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
+                        # Support entries shaped as (1, 3) or (3,) for image grid
+                        thw = image_grid_thw[image_index]
+                        thw = thw.squeeze() if hasattr(thw, "squeeze") else thw
+                        t, h, w = thw[0], thw[1], thw[2]
                         second_per_grid_t = 0
                         image_index += 1
                         remain_images -= 1
                         ed = ed_image
 
                     else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
+                        # Support entries shaped as (1, 3) or (3,) for video grid
+                        thw = video_grid_thw[video_index]
+                        thw = thw.squeeze() if hasattr(thw, "squeeze") else thw
+                        t, h, w = thw[0], thw[1], thw[2]
                         if second_per_grid_ts is not None:
                             second_per_grid_t = second_per_grid_ts[video_index]
                         else:
