@@ -4,6 +4,7 @@ from typing import Dict
 import torch
 import torch.distributed as dist
 from torch import nn, Tensor
+import torch.nn.functional as F
 from transformers import PreTrainedModel, AutoModelForCausalLM, AutoConfig
 from transformers import modeling_utils
 
@@ -59,6 +60,10 @@ class MMEBModel(nn.Module):
         self.temperature = temperature
 
         self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
+        self.info_nce_weight = 1.0
+        self.triplet_loss_weight = 0.0
+        self.triplet_margin = 0.2
+        self._warned_missing_triplet = False
 
         self.is_ddp = dist.is_initialized()
         if self.is_ddp:
@@ -346,12 +351,20 @@ class MMEBModel(nn.Module):
         self.encoder.save_pretrained(output_dir)
 
     # ===== forward：保持你最初的 InfoNCE/CE 计算 =====
-    def forward(self, qry: Dict[str, Tensor] = None, tgt: Dict[str, Tensor] = None, *args, **kwargs):
+    def forward(
+        self,
+        qry: Dict[str, Tensor] = None,
+        tgt: Dict[str, Tensor] = None,
+        *args,
+        return_embeddings: bool = False,
+        **kwargs,
+    ):
         qry_reps = self.encode_input(qry) if qry else None  # (bsz_per_device, dim)
         tgt_reps = self.encode_input(tgt) if tgt else None  # (bsz_per_device, dim)
 
         if qry_reps is None or tgt_reps is None:
-            return {"qry_reps": qry_reps, "tgt_reps": tgt_reps}
+            outputs = {"qry_reps": qry_reps, "tgt_reps": tgt_reps}
+            return outputs if return_embeddings else qry_reps
 
         if self.is_ddp:
             all_qry_reps = self._dist_gather_tensor(qry_reps)
@@ -360,16 +373,44 @@ class MMEBModel(nn.Module):
             all_qry_reps = qry_reps
             all_tgt_reps = tgt_reps
 
-        scores = self.compute_similarity(all_qry_reps, all_tgt_reps)
-        scores = scores.view(all_qry_reps.size(0), -1)
+        total_loss = None
+        losses = []
+        info_nce_loss = None
 
-        target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
-        target = target * (all_qry_reps.size(0) // all_tgt_reps.size(0))
+        if self.info_nce_weight > 0:
+            scores = self.compute_similarity(all_qry_reps, all_tgt_reps)
+            scores = scores.view(all_qry_reps.size(0), -1)
 
-        loss = self.cross_entropy(scores / self.temperature, target)
-        if self.is_ddp:
-            loss = loss * self.world_size
-        return loss
+            target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
+            target = target * (all_qry_reps.size(0) // all_tgt_reps.size(0))
+
+            info_nce_loss = self.cross_entropy(scores / self.temperature, target)
+            if self.is_ddp:
+                info_nce_loss = info_nce_loss * self.world_size
+            losses.append(self.info_nce_weight * info_nce_loss)
+
+        if losses:
+            total_loss = sum(losses)
+        else:
+            total_loss = torch.tensor(0.0, device=qry_reps.device, dtype=qry_reps.dtype)
+
+        # Store for optional debugging/inspection
+        self._last_loss_components = {
+            "info_nce_loss": info_nce_loss.detach() if info_nce_loss is not None else None,
+            "triplet_loss": None,
+        }
+        if not return_embeddings:
+            return total_loss
+
+        outputs = {
+            "loss": total_loss,
+            "info_nce_loss": info_nce_loss,
+            "qry_reps_gathered": all_qry_reps,
+            "tgt_reps_gathered": all_tgt_reps,
+            "qry_reps_local": qry_reps,
+            "tgt_reps_local": tgt_reps,
+        }
+        return outputs
 
     def _dist_gather_tensor(self, t: Tensor):
         t = t.contiguous()
@@ -381,3 +422,13 @@ class MMEBModel(nn.Module):
 
     def compute_similarity(self, q_reps, p_reps):
         return torch.matmul(q_reps, p_reps.transpose(0, 1))
+
+    def configure_loss(self, info_nce_weight=None, triplet_loss_weight=None, triplet_margin=None):
+        if info_nce_weight is not None:
+            self.info_nce_weight = info_nce_weight
+        if triplet_loss_weight is not None:
+            self.triplet_loss_weight = triplet_loss_weight
+        if triplet_margin is not None:
+            self.triplet_margin = triplet_margin
+        # Reset warning flag so toggling losses logs appropriately
+        self._warned_missing_triplet = False

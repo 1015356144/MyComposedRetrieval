@@ -126,9 +126,23 @@ class MMEBTrainer(Trainer):
             num_items_in_batch = num_items_in_batch.item()
         return batch_samples, num_items_in_batch
 
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        qry_inputs, tgt_inputs = inputs
-        return model(qry=qry_inputs, tgt=tgt_inputs)
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        if isinstance(inputs, (list, tuple)) and len(inputs) == 2:
+            qry_inputs, tgt_inputs = inputs
+        else:
+            raise ValueError("Expected inputs to be a (query, target) tuple")
+
+        outputs = model(qry=qry_inputs, tgt=tgt_inputs)
+        if isinstance(outputs, dict):
+            loss = outputs.get("loss", None)
+            if loss is None:
+                raise ValueError("Model did not return a loss value")
+            if return_outputs:
+                return loss, outputs
+            return loss
+        if return_outputs:
+            return outputs, outputs
+        return outputs
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         os.makedirs(output_dir, exist_ok=True)
@@ -764,10 +778,19 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
             fp16=self.args.fp16,
             scaler=self.scaler if self.args.fp16 else None
         )
+        self._warned_gc_triplet = False
 
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         model.train()
-        queries, targets = inputs
+        negatives = None
+        if len(inputs) == 3:
+            queries, targets, negatives = inputs
+        else:
+            queries, targets = inputs
+
+        if negatives is not None and getattr(model, "triplet_loss_weight", 0.0) > 0 and not self._warned_gc_triplet:
+            print_master("⚠️ Triplet loss is not supported with GradCache; triplet component will be skipped.")
+            self._warned_gc_triplet = True
 
         # 防止模型下游对意外 key 报错：弹掉调试字段
         if isinstance(queries, dict) and "sample_ids" in queries:
@@ -784,7 +807,8 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
             self.gc.models = [model, model]
             loss = self.gc(queries, targets, no_sync_except_last=_distributed)
         else:
-            loss = model(queries, targets)
+            outputs = model(queries, targets)
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         return loss / self._dist_loss_scale_factor
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):

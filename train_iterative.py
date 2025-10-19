@@ -429,6 +429,13 @@ def main():
                     'hard_neg_collection_freq': config.get('hard_neg_collection_freq', 1),
                     'caption_generation_batch_size': config.get('caption_generation_batch_size', 8)
                 })
+
+                if 'info_nce_weight' in config:
+                    training_args.info_nce_weight = config['info_nce_weight']
+                if 'triplet_loss_weight' in config:
+                    training_args.triplet_loss_weight = config['triplet_loss_weight']
+                if 'triplet_margin' in config:
+                    training_args.triplet_margin = config['triplet_margin']
                 
                 # Fast mode and production mode parameters
                 fast_mode = config.get('fast_mode', False)
@@ -456,6 +463,13 @@ def main():
         
         # Create initial dataset for iteration 0
         train_dataset = init_mixed_dataset(dataset_config, model_args, data_args, training_args)
+        
+        if hasattr(model, "configure_loss"):
+            model.configure_loss(
+                info_nce_weight=getattr(training_args, "info_nce_weight", 1.0),
+                triplet_loss_weight=getattr(training_args, "triplet_loss_weight", 0.0),
+                triplet_margin=getattr(training_args, "triplet_margin", 0.2),
+            )
         
         # Debug: Print iterative_params to verify fast_mode is included
         print_master(f"DEBUG: iterative_params = {iterative_params}")
@@ -493,6 +507,12 @@ def main():
         
     else:
         print_master("Creating standard trainer...")
+        if hasattr(model, "configure_loss"):
+            model.configure_loss(
+                info_nce_weight=getattr(training_args, "info_nce_weight", 1.0),
+                triplet_loss_weight=getattr(training_args, "triplet_loss_weight", 0.0),
+                triplet_margin=getattr(training_args, "triplet_margin", 0.2),
+            )
         trainer = IterativeRetrievalTrainer(
             model=model,
             foundation_model=foundation_model,

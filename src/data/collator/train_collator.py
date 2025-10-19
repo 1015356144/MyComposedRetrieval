@@ -221,8 +221,6 @@ class MultimodalDataCollator:
         try:
             qry_inputs = self._get_batch_inputs(examples, "query_text", "query_image")
             pos_inputs = self._get_batch_inputs(examples, "pos_text", "pos_image")
-            neg_inputs = self._get_batch_inputs(examples, "neg_text", "neg_image")
-            
             bs = len(qry_inputs['text'])
             assert bs > 0, 'An empty batch'
             
@@ -253,6 +251,15 @@ class MultimodalDataCollator:
                 else:
                     sid_list.append(torch.tensor(int(sid)))
             processed_qry_inputs["sample_ids"] = torch.stack(sid_list)
+            
+            ref_ids = []
+            aug_flags = []
+            for e in examples:
+                ref_ids.append(int(e.get("reference_id", -1)))
+                aug_flags.append(bool(e.get("is_augmented", False)))
+            processed_qry_inputs["reference_ids"] = torch.as_tensor(ref_ids, dtype=torch.long)
+            processed_qry_inputs["is_augmented"] = torch.as_tensor(aug_flags, dtype=torch.bool)
+
             return processed_qry_inputs, processed_pos_inputs
             
         except Exception as e:

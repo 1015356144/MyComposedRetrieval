@@ -64,6 +64,10 @@ class IterativeRetrievalDataset(Dataset, ABC):
         # In-memory augmentation stash (may be filled by caption generator step)
         self.augmented_samples: List[Dict[str, Any]] = []
 
+        # Reference-id bookkeeping so grouped samplers and losses can map
+        # paths to stable integer buckets.
+        self._reference_id_lookup: Dict[str, int] = {}
+
         # Optional: where retrieval candidates will be stored by a future step
         self.retrieval_candidates: List[str] = []
 
@@ -174,3 +178,17 @@ class IterativeRetrievalDataset(Dataset, ABC):
             "bytes": [None],
             "resolutions": [None],
         }
+
+    # ---------- Reference grouping helpers ----------
+    def _get_reference_id(self, reference_image: str) -> int:
+        """
+        Map a reference image path (relative or absolute) to a stable integer id.
+        This enables downstream components (samplers, triplet loss) to quickly
+        group all samples that share the same reference.
+        """
+        full_path = self._get_full_image_path(reference_image)
+        ref_id = self._reference_id_lookup.get(full_path)
+        if ref_id is None:
+            ref_id = len(self._reference_id_lookup)
+            self._reference_id_lookup[full_path] = ref_id
+        return ref_id

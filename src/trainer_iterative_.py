@@ -14,9 +14,10 @@ import torch
 import torch.distributed as dist
 import logging
 import statistics
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from torch.utils.data import DataLoader
 from transformers import TrainingArguments
+import torch.nn.functional as F
 
 from .trainer import MMEBTrainer
 from .model.model import MMEBModel
@@ -39,9 +40,16 @@ try:
 except Exception:
     llava_prepare, generate_with_llava = None, None
 try:
-    from src.prompt.generic.builder import prepare_inputs as generic_prepare, generate_with_generic
+from src.prompt.generic.builder import prepare_inputs as generic_prepare, generate_with_generic
 except Exception:
     generic_prepare, generate_with_generic = None, None
+
+from transformers.utils import (
+    WEIGHTS_NAME,
+    SAFE_WEIGHTS_NAME,
+    ADAPTER_WEIGHTS_NAME,
+    ADAPTER_SAFE_WEIGHTS_NAME,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -122,6 +130,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         self.hard_neg_collection_freq = hard_neg_collection_freq
         self.caption_generation_batch_size = caption_generation_batch_size
 
+        # Persist base loss weights (user-configured) and track per-iteration overrides
         self.current_iteration = 0
         self.iteration_metrics: Dict[int, Dict[str, float]] = {}
 
@@ -145,6 +154,167 @@ class IterativeRetrievalTrainer(MMEBTrainer):
 
         # 根据 fast / production 调整 save / logging 频率
         self._configure_training_mode()
+
+        # Cache user-configured loss weights for per-iteration adjustments
+        self._base_info_weight = getattr(self.args, "info_nce_weight", 1.0)
+        self._base_triplet_weight = getattr(self.args, "triplet_loss_weight", 0.0)
+        self._base_triplet_margin = getattr(self.args, "triplet_margin", 0.2)
+        self._current_info_weight = self._base_info_weight
+        self._current_triplet_weight = self._base_triplet_weight
+
+    def _apply_loss_weights_for_iteration(self):
+        """Configure model loss weights based on the current iteration."""
+        info_weight = 1.0 if getattr(self, "current_iteration", 0) == 0 else self._base_info_weight
+        triplet_weight = 0.0 if getattr(self, "current_iteration", 0) == 0 else self._base_triplet_weight
+
+        if hasattr(self.model, "configure_loss"):
+            self.model.configure_loss(
+                info_nce_weight=info_weight,
+                triplet_loss_weight=triplet_weight,
+                triplet_margin=self._base_triplet_margin,
+            )
+
+        self._current_info_weight = info_weight
+        self._current_triplet_weight = triplet_weight
+
+        print_master(
+            f"[LossConfig] iter={self.current_iteration} info_weight={info_weight} "
+            f"triplet_weight={triplet_weight} margin={self._base_triplet_margin}"
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        if not isinstance(inputs, (list, tuple)) or len(inputs) != 2:
+            raise ValueError("Expected (query_inputs, target_inputs) tuple from dataloader.")
+
+        qry_inputs, tgt_inputs = inputs
+        qry_inputs = dict(qry_inputs)
+        tgt_inputs = dict(tgt_inputs)
+
+        reference_ids = qry_inputs.pop("reference_ids", None)
+        is_augmented = qry_inputs.pop("is_augmented", None)
+
+        info_weight = getattr(self, "_current_info_weight", getattr(self.args, "info_nce_weight", 1.0))
+        triplet_weight = getattr(self, "_current_triplet_weight", getattr(self.args, "triplet_loss_weight", 0.0))
+
+        use_triplet = (
+            triplet_weight > 0
+            and getattr(self, "current_iteration", 0) >= 1
+            and reference_ids is not None
+        )
+
+        outputs = model(
+            qry=qry_inputs,
+            tgt=tgt_inputs,
+            return_embeddings=use_triplet,
+        )
+
+        if isinstance(outputs, dict):
+            base_loss = outputs["loss"]
+        else:
+            base_loss = outputs
+            outputs = {"loss": base_loss}
+
+        loss = base_loss
+
+        triplet_loss = None
+        if use_triplet:
+            triplet_loss = self._compute_intra_reference_triplet(
+                outputs.get("qry_reps_local"),
+                outputs.get("tgt_reps_local"),
+                reference_ids,
+                is_augmented,
+            )
+            if triplet_loss is not None:
+                if loss.requires_grad:
+                    loss = loss + triplet_weight * triplet_loss
+                else:
+                    loss = triplet_weight * triplet_loss
+                outputs["triplet_loss"] = triplet_loss
+                if hasattr(model, "_last_loss_components"):
+                    model._last_loss_components["triplet_loss"] = triplet_loss.detach()
+
+                current_step = getattr(self.state, "global_step", 0)
+                log_every = max(1, getattr(self.args, "logging_steps", 10))
+                if current_step < 5 or ((current_step + 1) % log_every == 0):
+                    info_val = outputs.get("info_nce_loss")
+                    info_val = info_val.detach().item() if info_val is not None else None
+                    margin_val = getattr(self.model, "triplet_margin", getattr(self.args, "triplet_margin", 0.2))
+                    print_master(
+                        f"[TripletLoss] iter={self.current_iteration} "
+                        f"step={current_step} info_nce={info_val} "
+                        f"triplet={triplet_loss.detach().item():.6f} "
+                        f"margin={margin_val} "
+                        f"weights(info={info_weight}, "
+                        f"triplet={triplet_weight})"
+                    )
+
+        if return_outputs:
+            outputs["loss"] = loss
+            return loss, outputs
+        return loss
+
+    def _compute_intra_reference_triplet(
+        self,
+        qry_reps: Optional[torch.Tensor],
+        tgt_reps: Optional[torch.Tensor],
+        reference_ids: Optional[torch.Tensor],
+        is_augmented: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if qry_reps is None or tgt_reps is None or reference_ids is None:
+            return None
+
+        # reference_ids / is_augmented may come from CPU tensors (depending on accelerator settings)
+        reference_ids = reference_ids.to(qry_reps.device)
+        if is_augmented is not None:
+            is_augmented = is_augmented.to(qry_reps.device)
+
+        unique_refs = torch.unique(reference_ids)
+        weighted_losses = []
+        total_triplets = 0
+        margin = getattr(self.args, "triplet_margin", 0.2)
+
+        for ref in unique_refs:
+            mask = reference_ids == ref
+            group_size = int(mask.sum().item())
+            if group_size < 2:
+                continue
+
+            anchor_q = qry_reps[mask]
+            pos_t = tgt_reps[mask]
+
+            anchors_exp = anchor_q.unsqueeze(1).expand(group_size, group_size, -1)
+            positives_exp = pos_t.unsqueeze(1).expand(group_size, group_size, -1)
+            negatives_exp = pos_t.unsqueeze(0).expand(group_size, group_size, -1)
+
+            off_diag_mask = ~torch.eye(group_size, dtype=torch.bool, device=anchor_q.device)
+            anchors = anchors_exp[off_diag_mask]
+            positives = positives_exp[off_diag_mask]
+            negatives = negatives_exp[off_diag_mask]
+
+            if anchors.numel() == 0:
+                continue
+
+            group_loss = F.triplet_margin_loss(
+                anchors,
+                positives,
+                negatives,
+                margin=margin,
+                reduction="mean",
+            )
+            triplet_count = group_size * (group_size - 1)
+            weighted_losses.append(group_loss * triplet_count)
+            total_triplets += triplet_count
+
+        if total_triplets == 0 or not weighted_losses:
+            # ensure a tensor connected to graph so downstream loss keeps gradients
+            return qry_reps.sum() * 0.0
+
+        triplet_loss = torch.stack(weighted_losses).sum() / float(total_triplets)
+
+        if torch.distributed.is_initialized():
+            triplet_loss = triplet_loss * torch.distributed.get_world_size()
+
+        return triplet_loss
 
 
     def _try_resume_from_checkpoint(self) -> bool:
@@ -348,6 +518,10 @@ class IterativeRetrievalTrainer(MMEBTrainer):
 
         # 1) 用最初的数据集并刷新 dataloader
         self.train_dataset = self.original_dataset
+
+        # 确保迭代 0 使用纯 InfoNCE（triplet 关闭）
+        self.current_iteration = 0
+        self._apply_loss_weights_for_iteration()
         self._update_train_dataloader()
 
         # 2) 在独立子目录里训练，避免多轮 checkpoint 冲突
@@ -402,6 +576,9 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         # 1) 说明：权重已在外部 main() 完成加载；此处只负责训练流程控制
         print_master("🧠 Model weights already loaded by main() function")
         print_master("🔄 Will reset optimizer and scheduler for independent learning rate schedule")
+
+        # 在刷新 dataloader 前设置本轮的损失权重
+        self._apply_loss_weights_for_iteration()
 
         # 2) 确保数据集与采样器已更新
         self._update_train_dataloader()

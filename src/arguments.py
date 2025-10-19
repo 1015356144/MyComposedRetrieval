@@ -78,14 +78,6 @@ class TrainingArguments(TrainingArguments):
     max_iterations: int = field(default=3, metadata={"help": "Maximum number of iterative training rounds"})
     hard_neg_collection_freq: int = field(default=1, metadata={"help": "Frequency of hard negative collection (every N iterations)"})
     caption_generation_batch_size: int = field(default=8, metadata={"help": "Batch size for foundation model caption generation"})
-
-
-@dataclass
-class MTEBArguments:
-    device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})
-    batch_size_per_device: int = field(default=16, metadata={"help": ""})
-    max_length: int = field(default=512, metadata={"help": ""})
-    eval_output_dir: str = field(default=None, metadata={"help": "directory for saving trained models"})
-    task_types: List[str] = field(default=None, metadata={"help": ""})
-    tasks: List[str] = field(default=None, metadata={"help": ""})
-    prompt_family: List[str] = field(default=None, metadata={"help": ""})
+    info_nce_weight: float = field(default=0.5, metadata={"help": "Weight for the InfoNCE contrastive loss"})
+    triplet_loss_weight: float = field(default=0.5, metadata={"help": "Weight for the triplet margin loss"})
+    triplet_margin: float = field(default=0.2, metadata={"help": "Margin used by the triplet loss"})
