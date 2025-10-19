@@ -40,9 +40,19 @@ try:
 except Exception:
     llava_prepare, generate_with_llava = None, None
 try:
-from src.prompt.generic.builder import prepare_inputs as generic_prepare, generate_with_generic
+    from src.prompt.generic.builder import prepare_inputs as generic_prepare, generate_with_generic
 except Exception:
     generic_prepare, generate_with_generic = None, None
+
+try:
+    from peft import PeftModel
+    try:
+        from peft.utils.other import set_peft_model_state_dict
+    except ImportError:  # pragma: no cover - older PEFT versions
+        from peft.utils import set_peft_model_state_dict  # type: ignore
+except Exception:  # pragma: no cover - PEFT not installed
+    PeftModel = None  # type: ignore
+    set_peft_model_state_dict = None  # type: ignore
 
 from transformers.utils import (
     WEIGHTS_NAME,
@@ -56,6 +66,13 @@ logger = logging.getLogger(__name__)
 
 
 class IterativeRetrievalTrainer(MMEBTrainer):
+
+    METRIC_ALIASES = {
+        "recall_at_1": ["recall_at_1", "r_at_1"],
+        "recall_at_5": ["recall_at_5", "r_at_5"],
+        "recall_at_10": ["recall_at_10", "r_at_10"],
+    }
+
     def __init__(
         self,
         foundation_model=None,                 # 忽略传进来的实例（保持兼容）
@@ -628,25 +645,351 @@ class IterativeRetrievalTrainer(MMEBTrainer):
 
         return train_result
 
-    def _evaluate_current_model(self) -> Dict[str, float]:
-        """Evaluate current model on validation set with caching & distributed support (decoupled layout)."""
+    def _parse_checkpoint_step(self, checkpoint_name: str) -> Optional[int]:
+        """Extract the step number from a checkpoint directory name."""
+        try:
+            return int(checkpoint_name.split("-")[-1])
+        except (ValueError, IndexError):
+            return None
+
+    def _list_iteration_checkpoints(self, iteration: int) -> List[Tuple[int, str, str]]:
+        """Return a sorted list of (step, name, path) tuples for checkpoints of a given iteration."""
+        iteration_dir = os.path.join(self.args.output_dir, f"training_iter_{iteration}")
+        checkpoints: List[Tuple[int, str, str]] = []
+
+        if not os.path.isdir(iteration_dir):
+            return checkpoints
+
+        for entry in sorted(os.listdir(iteration_dir)):
+            if not entry.startswith("checkpoint-"):
+                continue
+            checkpoint_path = os.path.join(iteration_dir, entry)
+            if not os.path.isdir(checkpoint_path):
+                continue
+            step = self._parse_checkpoint_step(entry)
+            if step is None:
+                continue
+            checkpoints.append((step, entry, checkpoint_path))
+
+        checkpoints.sort(key=lambda item: item[0])
+        return checkpoints
+
+    def _load_checkpoint_into_model(self, checkpoint_path: str):
+        """Load encoder (and adapter) weights from a specific checkpoint directory into the active model."""
+        from .utils import print_master
+
+        weight_files = [
+            (ADAPTER_SAFE_WEIGHTS_NAME, "safetensors"),
+            (ADAPTER_WEIGHTS_NAME, "bin"),
+            (SAFE_WEIGHTS_NAME, "safetensors"),
+            (WEIGHTS_NAME, "bin"),
+        ]
+
+        for filename, weight_type in weight_files:
+            full_path = os.path.join(checkpoint_path, filename)
+            if not os.path.exists(full_path):
+                continue
+
+            if weight_type == "safetensors":
+                try:
+                    from safetensors.torch import load_file as load_safetensors
+                except ImportError as exc:
+                    raise ImportError(
+                        f"无法加载 {full_path}，因为缺少 safetensors 依赖。请安装 safetensors 后重试。"
+                    ) from exc
+                state_dict = load_safetensors(full_path, device="cpu")
+            else:
+                state_dict = torch.load(full_path, map_location="cpu")
+
+            missing_keys: List[str] = []
+            unexpected_keys: List[str] = []
+
+            encoder = getattr(self.model, "encoder", None)
+            is_peft_model = PeftModel is not None and isinstance(encoder, PeftModel)
+
+            if is_peft_model and set_peft_model_state_dict is not None:
+                try:
+                    missing_keys, unexpected_keys = set_peft_model_state_dict(
+                        encoder, state_dict, adapter_name=getattr(encoder, "active_adapter", None)
+                    )
+                except Exception as exc:
+                    print_master(f"⚠️ Failed to load PEFT adapter from {checkpoint_path}: {exc}. Falling back to load_state_dict.")
+                    missing_keys, unexpected_keys = encoder.load_state_dict(state_dict, strict=False)
+            else:
+                missing_keys, unexpected_keys = encoder.load_state_dict(state_dict, strict=False)
+
+            if missing_keys:
+                preview = ", ".join(missing_keys[:5])
+                if len(missing_keys) > 5:
+                    preview += ", ..."
+                print_master(f"⚠️ Missing keys when loading {checkpoint_path}: {preview}")
+            if unexpected_keys:
+                preview = ", ".join(unexpected_keys[:5])
+                if len(unexpected_keys) > 5:
+                    preview += ", ..."
+                print_master(f"⚠️ Unexpected keys when loading {checkpoint_path}: {preview}")
+
+            return
+
+        raise FileNotFoundError(
+            f"未在 {checkpoint_path} 中找到可加载的模型权重文件 "
+            f"({ADAPTER_SAFE_WEIGHTS_NAME}/{ADAPTER_WEIGHTS_NAME}/{SAFE_WEIGHTS_NAME}/{WEIGHTS_NAME})."
+        )
+
+    def _get_metric_value(self, metrics: Dict[str, float], key: str) -> Optional[float]:
+        """Fetch metric value with alias support."""
+        aliases = self.METRIC_ALIASES.get(key, [key])
+        for alias in aliases:
+            if alias in metrics and metrics[alias] is not None:
+                return metrics[alias]
+        return None
+
+    def _normalize_metric_aliases(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure canonical metric keys exist even if evaluator returns alias names."""
+        normalized = dict(metrics)
+        for canonical in self.METRIC_ALIASES.keys():
+            if canonical not in normalized:
+                value = self._get_metric_value(metrics, canonical)
+                if value is not None:
+                    normalized[canonical] = value
+        return normalized
+
+    def _is_metrics_better(
+        self,
+        candidate: Dict[str, float],
+        reference: Dict[str, float],
+        candidate_step: Optional[int] = None,
+        reference_step: Optional[int] = None,
+    ) -> bool:
+        """Compare two metric dicts using Recall@1 as primary, Recall@5/10 as tie-breakers, then smaller step."""
+        priority_metrics = ["recall_at_1", "recall_at_5", "recall_at_10"]
+
+        for metric in priority_metrics:
+            cand_value = self._get_metric_value(candidate, metric)
+            ref_value = self._get_metric_value(reference, metric)
+
+            if cand_value is None and ref_value is None:
+                continue
+            if cand_value is None:
+                return False
+            if ref_value is None:
+                return True
+            if cand_value > ref_value:
+                return True
+            if cand_value < ref_value:
+                return False
+
+        if candidate_step is not None and reference_step is not None:
+            return candidate_step < reference_step
+
+        return False
+
+    def _save_iteration_model_from_current_weights(self, iteration: int):
+        """Persist current model weights as the iteration representative (handles base iteration separately)."""
+        target_dir = os.path.join(
+            self.args.output_dir,
+            "base_model" if iteration == 0 else f"iteration_{iteration}",
+        )
+        self.save_model(target_dir)
+        from .utils import print_master
+        print_master(
+            f"💾 Saved selected weights for iteration {iteration} to {target_dir}"
+        )
+
+    def _write_checkpoint_metrics_summary(
+        self,
+        iteration: int,
+        entries: List[Dict[str, Any]],
+        selected_checkpoint: Optional[str],
+        selected_step: Optional[int],
+    ):
+        """Persist per-checkpoint evaluation metrics for later inspection."""
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        summary_path = os.path.join(self.args.output_dir, f"iteration_{iteration}_checkpoint_metrics.json")
+        tmp_path = summary_path + ".tmp"
+        summary_payload = {
+            "iteration": iteration,
+            "selection_metric": "recall_at_1",
+            "tie_breakers": ["recall_at_5", "recall_at_10", "lower_step"],
+            "selected_checkpoint": selected_checkpoint,
+            "selected_step": selected_step,
+            "checkpoints": entries,
+        }
+        with open(tmp_path, "w") as f:
+            json.dump(summary_payload, f, indent=2)
+        os.replace(tmp_path, summary_path)
+        from .utils import print_master
+        print_master(f"📝 Stored checkpoint evaluation summary at {summary_path}")
+
+    def _write_iteration_eval_file(self, iteration: int, metrics: Dict[str, Any]):
+        """Write the final evaluation results file for an iteration."""
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        eval_path = os.path.join(self.args.output_dir, f"eval_results_iter_{iteration}.json")
+        tmp_path = eval_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        os.replace(tmp_path, eval_path)
+        from .utils import print_master
+        print_master(f"✅ Final evaluation results saved to {eval_path}")
+
+    def _evaluate_iteration_checkpoints(self, iteration: int) -> Dict[str, Any]:
+        """
+        Evaluate all saved checkpoints for this iteration, choose the best by Recall@1,
+        persist per-checkpoint metrics, and ensure the selected weights are saved for the next iteration.
+        """
+        from .utils import print_master
+
+        checkpoints = self._list_iteration_checkpoints(iteration)
+        summary_entries: List[Dict[str, Any]] = []
+        best_checkpoint: Optional[Dict[str, Any]] = None
+
+        if not checkpoints:
+            print_master(f"⚠️ No checkpoints found for iteration {iteration}; evaluating current model only.")
+            metrics = self._normalize_metric_aliases(
+                dict(self._evaluate_current_model(iteration=iteration, reuse_cached=True))
+            )
+            metrics.setdefault("selected_checkpoint", None)
+            metrics.setdefault("selected_step", None)
+            summary_entries.append({
+                "checkpoint": None,
+                "step": None,
+                "metrics": metrics,
+                "note": "no checkpoints were saved for this iteration",
+            })
+            self._save_iteration_model_from_current_weights(iteration)
+            self._write_checkpoint_metrics_summary(iteration, summary_entries, None, None)
+            self._write_iteration_eval_file(iteration, metrics)
+            return metrics
+
+        for step, name, path in checkpoints:
+            suffix = f"_{name}"
+            try:
+                metrics = dict(
+                    self._evaluate_current_model(
+                        iteration=iteration,
+                        checkpoint_path=path,
+                        results_suffix=suffix,
+                        reuse_cached=True,
+                    )
+                )
+                metrics = self._normalize_metric_aliases(metrics)
+                metrics.setdefault("checkpoint", name)
+                metrics.setdefault("iteration", iteration)
+                summary_entries.append({
+                    "checkpoint": name,
+                    "step": step,
+                    "metrics": metrics,
+                })
+
+                if best_checkpoint is None or self._is_metrics_better(
+                    metrics,
+                    best_checkpoint["metrics"],
+                    candidate_step=step,
+                    reference_step=best_checkpoint["step"],
+                ):
+                    best_checkpoint = {
+                        "checkpoint": path,
+                        "checkpoint_name": name,
+                        "step": step,
+                        "metrics": metrics,
+                    }
+            except Exception as exc:
+                error_entry = {
+                    "checkpoint": name,
+                    "step": step,
+                    "error": str(exc),
+                }
+                summary_entries.append(error_entry)
+                print_master(f"⚠️ Evaluation failed for {name}: {exc}")
+
+        if best_checkpoint is None:
+            print_master(f"⚠️ All checkpoint evaluations failed for iteration {iteration}; using current model.")
+            metrics = self._normalize_metric_aliases(
+                dict(self._evaluate_current_model(iteration=iteration, reuse_cached=True))
+            )
+            metrics.setdefault("selected_checkpoint", None)
+            metrics.setdefault("selected_step", None)
+            summary_entries.append({
+                "checkpoint": None,
+                "step": None,
+                "metrics": metrics,
+                "note": "all checkpoint evaluations failed; using current weights",
+            })
+            self._save_iteration_model_from_current_weights(iteration)
+            self._write_checkpoint_metrics_summary(iteration, summary_entries, None, None)
+            self._write_iteration_eval_file(iteration, metrics)
+            return metrics
+
+        # Ensure the best checkpoint weights are loaded before saving iteration model
+        self._load_checkpoint_into_model(best_checkpoint["checkpoint"])
+        best_metrics = self._normalize_metric_aliases(dict(best_checkpoint["metrics"]))
+        best_metrics["selected_checkpoint"] = best_checkpoint["checkpoint_name"]
+        best_metrics["selected_step"] = best_checkpoint["step"]
+
+        print_master(
+            f"🏆 Iteration {iteration}: selected {best_checkpoint['checkpoint_name']} "
+            f"(step {best_checkpoint['step']}) based on Recall@1."
+        )
+
+        self._save_iteration_model_from_current_weights(iteration)
+        self._write_checkpoint_metrics_summary(
+            iteration,
+            summary_entries,
+            best_checkpoint["checkpoint_name"],
+            best_checkpoint["step"],
+        )
+        self._write_iteration_eval_file(iteration, best_metrics)
+
+        return best_metrics
+
+    def _evaluate_current_model(
+        self,
+        iteration: Optional[int] = None,
+        checkpoint_path: Optional[str] = None,
+        results_suffix: Optional[str] = None,
+        reuse_cached: bool = True,
+    ) -> Dict[str, float]:
+        """Evaluate current (or specified checkpoint) model with optional caching."""
         import os, json
         import torch.distributed as dist
         from .utils import print_master
 
-        print_master(f"Evaluating iteration {self.current_iteration} model...")
+        iteration = self.current_iteration if iteration is None else iteration
+        suffix = ""
+        if results_suffix:
+            suffix = results_suffix
+        elif checkpoint_path:
+            suffix = f"_{os.path.basename(checkpoint_path)}"
+        suffix = suffix.replace(os.path.sep, "_")
 
-        # 1) 先看缓存
-        eval_results_file = os.path.join(self.args.output_dir, f"eval_results_iter_{self.current_iteration}.json")
-        if os.path.exists(eval_results_file):
-            print_master(f"Found cached evaluation results for iteration {self.current_iteration}, loading...")
+        if suffix:
+            per_ckpt_dir = os.path.join(self.args.output_dir, f"iteration_{iteration}_checkpoint_eval")
+            os.makedirs(per_ckpt_dir, exist_ok=True)
+            eval_results_file = os.path.join(per_ckpt_dir, f"eval_results_iter_{iteration}{suffix}.json")
+        else:
+            eval_results_file = os.path.join(self.args.output_dir, f"eval_results_iter_{iteration}.json")
+
+        if checkpoint_path:
+            print_master(f"Evaluating checkpoint {checkpoint_path} for iteration {iteration}...")
+            self._load_checkpoint_into_model(checkpoint_path)
+        else:
+            print_master(f"Evaluating iteration {iteration} model (current weights)...")
+
+        if reuse_cached and os.path.exists(eval_results_file):
             try:
                 with open(eval_results_file, "r") as f:
                     cached = json.load(f)
-                print_master(f"Loaded cached evaluation results: {cached}")
+                print_master(f"Loaded cached evaluation from {eval_results_file}")
+                cached.setdefault("iteration", int(iteration))
+                if checkpoint_path:
+                    cached.setdefault("checkpoint", os.path.basename(checkpoint_path))
                 return cached
             except Exception as e:
-                print_master(f"Error loading cached evaluation results: {e}; will re-evaluate.")
+                print_master(f"Failed to read cached evaluation {eval_results_file}: {e}. Re-evaluating.")
 
         # 2) 准备 evaluator（兼容绝对/相对导入）
         try:
@@ -700,7 +1043,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             # 元数据
             eval_results["evaluation_mode"] = "distributed" if use_distributed else "single_gpu"
             eval_results["fast_mode"] = bool(getattr(self, "fast_mode", False))
-            eval_results["iteration"] = int(self.current_iteration)
+            eval_results["iteration"] = int(iteration)
 
         except Exception as e:
             print_master(f"Real evaluation failed: {e}")
@@ -718,7 +1061,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     "group_recall_at_3": 0.38,
                     "evaluation_mode": "dummy_fast",
                     "fast_mode": True,
-                    "iteration": int(self.current_iteration),
+                    "iteration": int(iteration),
                 }
             else:
                 eval_results = {
@@ -733,8 +1076,11 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                     "group_recall_at_3": 0.70,
                     "evaluation_mode": "dummy_production",
                     "fast_mode": False,
-                    "iteration": int(self.current_iteration),
+                    "iteration": int(iteration),
                 }
+
+        if checkpoint_path:
+            eval_results["checkpoint"] = os.path.basename(checkpoint_path)
 
         # 4) 仅 rank0 落盘
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -745,7 +1091,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             except Exception as e:
                 print_master(f"Warning: failed to save evaluation results: {e}")
 
-        print_master(f"Iteration {self.current_iteration} results: {eval_results}")
+        print_master(f"Iteration {iteration} evaluation results: {eval_results}")
         return eval_results
 
     def _prepare_next_iteration_dataset(self, next_iteration: int, augmented_samples: List[Dict]):
@@ -1566,7 +1912,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             if not completed_steps.get('evaluation', False):
                 if dist.is_initialized():
                     dist.barrier()  # 确保大家都训练结束
-                eval_results = self._evaluate_current_model()
+                eval_results = self._evaluate_iteration_checkpoints(iteration)
                 self.iteration_metrics[iteration] = eval_results
             else:
                 print_master("✅ Model evaluation already completed, loading cached results...")
@@ -1574,10 +1920,11 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 try:
                     with open(eval_file, 'r') as f:
                         eval_results = json.load(f)
+                    eval_results = self._normalize_metric_aliases(eval_results)
                     self.iteration_metrics[iteration] = eval_results
                 except Exception as e:
                     print_master(f"⚠️ Failed to load cached eval results: {e}. Re-evaluating...")
-                    eval_results = self._evaluate_current_model()
+                    eval_results = self._normalize_metric_aliases(self._evaluate_current_model())
                     self.iteration_metrics[iteration] = eval_results
 
             # ------------------------------------------------------
