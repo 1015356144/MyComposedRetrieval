@@ -109,6 +109,7 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
             add_image_token=True,
         )
 
+        ref_full_path = self._get_full_image_path(ref_image_path)
         return {
             "query_text": query_text,
             "query_image": self._load_image(ref_image_path),
@@ -118,7 +119,8 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
             "neg_image": self._load_image(ref_image_path),
             "global_dataset_name": "CIRR",
             # 关键：统一规范化 reference_image，确保与增强样本一致，从而能被 sampler 分到同一组
-            "reference_image": self._get_full_image_path(ref_image_path),
+            "reference_image": ref_full_path,
+            "reference_id": self._get_reference_id(ref_full_path),
             "is_augmented": False,
         }
 
@@ -163,6 +165,7 @@ class IterativeCIRRDataset(IterativeRetrievalDataset):
             "original_mod_text": sample.get("original_mod_text", ""),
             # 关键：与原始样本相同规则的规范化 reference_image，确保分组一致
             "reference_image": ref_path,
+            "reference_id": self._get_reference_id(ref_path),
         }
 
 

@@ -82,6 +82,9 @@ class IterativeFashionIQDataset(IterativeRetrievalDataset):
             add_image_token=True,
         )
         
+        ref_full_path = self._get_full_image_path(ref_image_path)
+        tgt_full_path = self._get_full_image_path(target_image_path)
+
         return {
             "query_text": query_text,
             "query_image": self._load_image(ref_image_path),
@@ -90,7 +93,9 @@ class IterativeFashionIQDataset(IterativeRetrievalDataset):
             "neg_text": neg_text,
             "neg_image": self._load_image(ref_image_path),
             "global_dataset_name": "FashionIQ",
-            "reference_image": ref_image_path,  # for GroupedBatchSampler
+            "reference_image": ref_full_path,  # normalized for grouping
+            "reference_id": self._get_reference_id(ref_full_path),
+            "is_augmented": False,
             "category": sample.get("category", ""),  # FashionIQ特有的类别信息
         }
 
@@ -118,6 +123,8 @@ class IterativeFashionIQDataset(IterativeRetrievalDataset):
             add_image_token=True,
         )
         
+        ref_full_path = self._get_full_image_path(sample["reference_image"])
+
         return {
             "query_text": query_text,
             "query_image": self._load_image(sample["reference_image"]),
@@ -128,6 +135,7 @@ class IterativeFashionIQDataset(IterativeRetrievalDataset):
             "global_dataset_name": "FashionIQ",
             "is_augmented": True,
             "original_mod_text": sample.get("original_mod_text", ""),
-            "reference_image": sample["reference_image"],
+            "reference_image": ref_full_path,
+            "reference_id": self._get_reference_id(ref_full_path),
             "category": sample.get("category", ""),  # FashionIQ特有的类别信息
         }
