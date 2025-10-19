@@ -10,13 +10,18 @@ import torch
 
 from ..dataset.cirr import IterativeCIRRDataset
 from ..dataset.fashioniq import IterativeFashionIQDataset
-from ..dataset.nhr_edit_dataset import IterativeNHREditDataset
+
+try:
+    from ..dataset.nhr_edit_dataset import IterativeNHREditDataset
+except ImportError:
+    IterativeNHREditDataset = None
 
 DATASET_PARSERS = {
     'IterativeCIRRDataset': IterativeCIRRDataset,
     'IterativeFashionIQDataset': IterativeFashionIQDataset,
-    'IterativeNHREditDataset': IterativeNHREditDataset,
 }
+if IterativeNHREditDataset is not None:
+    DATASET_PARSERS['IterativeNHREditDataset'] = IterativeNHREditDataset
 
 def init_mixed_dataset(dataset_config, model_args, data_args, training_args):
     weights = [d['weight'] for d in dataset_config.values()]
@@ -60,4 +65,3 @@ def init_mixed_dataset(dataset_config, model_args, data_args, training_args):
         print_master("Skipping split_dataset_by_node for single custom dataset; Trainer will use .shard() method.")
 
     return train_dataset
-

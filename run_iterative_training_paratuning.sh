@@ -7,7 +7,7 @@
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 2
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 8
 #   ./run_iterative_training_r16_d01.sh cirr qwen2vl 2 ./experiments/IterativeCIRR_qwen2vl_20250805_000011
-#   bash ./run_iterative_training_paratuning.sh cirr qwen2_5vl_7b 1
+#   bash ./run_iterative_training_paratuning.sh cirr qwen2_5vl_7b 1 ./experiments/IterativeCIRR_qwen2_5vl_7b_20251012_004205_copy_gruopsamplerfix_copy_triplet_loss_i0_t1
 # Notes:
 # - This script uses LoRA with r=16, dropout=0.1 and (default) alpha=32 (override via $LORA_ALPHA).
 # - Iterative training with grouped-by-reference-image sampler remains enabled.
@@ -178,6 +178,9 @@ if (( NUM_GPUS > 1 )); then
     --pooling eos \
     --normalize True \
     --temperature 0.02 \
+    --info_nce_weight 0.9 \
+    --triplet_loss_weight 0.1 \
+    --triplet_margin 0.05 \
     --dataset_config \"$CONFIG_FILE\" \
     --run_name \"$EXP_NAME\" \
     --project_name \"$WANDB_PROJECT\" \
@@ -225,6 +228,9 @@ else
     --pooling eos \
     --normalize True \
     --temperature 0.02 \
+    --info_nce_weight 0.15 \
+    --triplet_loss_weight 1.0 \
+    --triplet_margin 0.2 \
     --dataset_config \"$CONFIG_FILE\" \
     --run_name \"$EXP_NAME\" \
     --project_name \"$WANDB_PROJECT\" \
