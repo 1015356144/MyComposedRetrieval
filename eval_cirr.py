@@ -10,6 +10,7 @@ import json
 import torch
 import logging
 import re  # NEW
+from pathlib import Path
 from typing import Dict
 from dataclasses import dataclass, field
 from transformers import HfArgumentParser
@@ -183,6 +184,70 @@ def create_eval_config_if_needed(eval_args: CIRREvalArguments) -> str:
     return None
 
 
+DEFAULT_RESIZE_MAX_PIXELS = 28 * 28 * 1280
+
+
+def _find_file_in_hierarchy(model_path: str, filename: str) -> Path:
+    """
+    Search for a file in the model directory, its parents, and common sibling folders.
+    Useful for locating artifacts like preprocessor_config.json or training_args.bin.
+    """
+    path = Path(model_path).resolve()
+    candidates = [
+        path,
+        path.parent if path.is_dir() else path.parent,
+        path.parent / "base_model",
+        path.parent.parent if path.parent != path else path.parent.parent,
+    ]
+    seen = set()
+    for base in candidates:
+        if base is None or base in seen:
+            continue
+        seen.add(base)
+        target = base / filename
+        if target.exists():
+            return target
+    return None
+
+
+def _align_data_args_with_training(model_path: str, data_args: DataArguments, verbose=True):
+    """
+    Align evaluation data arguments with training metadata when possible.
+    Currently focuses on resize_max_pixels so evaluation and training use consistent resolutions.
+    """
+    preprocessor_cfg = _find_file_in_hierarchy(model_path, "preprocessor_config.json")
+    training_max_pixels = None
+
+    if preprocessor_cfg and preprocessor_cfg.exists():
+        try:
+            with open(preprocessor_cfg, "r") as f:
+                cfg = json.load(f)
+            training_max_pixels = cfg.get("max_pixels") or cfg.get("size", {}).get("max_pixels")
+        except Exception as exc:
+            if verbose:
+                print_master(f"Warning: Failed to read {preprocessor_cfg}: {exc}")
+
+    user_specified = getattr(data_args, "resize_max_pixels", None)
+    if user_specified is None:
+        user_specified = DEFAULT_RESIZE_MAX_PIXELS
+
+    if training_max_pixels is not None:
+        if user_specified == DEFAULT_RESIZE_MAX_PIXELS:
+            data_args.resize_max_pixels = training_max_pixels
+            if verbose:
+                print_master(f"✅ Aligning resize_max_pixels with training value: {training_max_pixels}")
+        else:
+            if verbose:
+                print_master(f"✅ Using user-specified resize_max_pixels: {user_specified}")
+    else:
+        if user_specified != DEFAULT_RESIZE_MAX_PIXELS:
+            if verbose:
+                print_master(f"✅ Using user-specified resize_max_pixels: {user_specified}")
+        else:
+            if verbose:
+                print_master("⚠️ Could not infer training resize_max_pixels; using library default.")
+
+
 def load_model_and_processor(eval_args: CIRREvalArguments, model_args: ModelArguments, data_args: DataArguments):
     """Load model and processor with proper error handling"""
     print_master("=" * 60)
@@ -226,20 +291,16 @@ def load_model_and_processor(eval_args: CIRREvalArguments, model_args: ModelArgu
     model_args.checkpoint_path = eval_args.model_path
     model_args.lora = lora_mode or getattr(model_args, 'lora', False)
 
-    # 对齐训练关键参数
-    print_master("Overriding ModelArguments defaults to match training configuration...")
-    model_args.pooling = 'eos'
-    model_args.normalize = True
-    print_master(f"✅ Set pooling={model_args.pooling}, normalize={model_args.normalize}")
+    # 尝试与训练时配置对齐（保留自定义的 resize_max_pixels 用于实验）
+    _align_data_args_with_training(eval_args.model_path, data_args)
 
-    data_args.max_len = 512
     # 备选分辨率（便于快速切换做对比测试）
     # data_args.resize_max_pixels = 35840   #  ~sqrt(35840)=189 (早期小分辨率/调试)
     # data_args.resize_max_pixels = 50176   # 224*224
     # data_args.resize_max_pixels = 82944   # 288*288
-    data_args.resize_max_pixels = 147456  # 384*384
+    # data_args.resize_max_pixels = 147456  # 384*384
     # data_args.resize_max_pixels = 262144  # 512*512 默认评测分辨率
-    print_master(f"✅ Set max_len={data_args.max_len}, resize_max_pixels={data_args.resize_max_pixels}")
+    print_master(f"✅ Set resize_max_pixels={data_args.resize_max_pixels}")
 
     # Backbone 识别：优先 true config，再 fallback
     try:
@@ -265,9 +326,12 @@ def load_model_and_processor(eval_args: CIRREvalArguments, model_args: ModelArgu
     if model_args.lora:
         print_master("Loading LoRA model (base + adapter)...")
         try:
-            model = MMEBModel.load(model_args, is_trainable=False)
+            # Keep adapters unmerged to replicate training-time evaluation exactly
+            model = MMEBModel.load(model_args, is_trainable=True)
             model.eval()
-            print_master("✅ LoRA model loaded successfully")
+            for param in model.parameters():
+                param.requires_grad_(False)
+            print_master("✅ LoRA model loaded successfully (adapters kept unmerged)")
         except Exception as e:
             print_master(f"❌ LoRA model loading failed: {e}")
             raise
@@ -319,6 +383,12 @@ def load_model_and_processor(eval_args: CIRREvalArguments, model_args: ModelArgu
         raise
 
     setattr(model, 'processor', processor)
+    print_master(
+        f"Final evaluation args -> pooling: {getattr(model_args, 'pooling', None)}, "
+        f"normalize: {getattr(model_args, 'normalize', None)}, "
+        f"max_len: {getattr(data_args, 'max_len', None)}, "
+        f"resize_max_pixels: {getattr(data_args, 'resize_max_pixels', None)}"
+    )
     print_master("=" * 60)
     return model, processor
 
