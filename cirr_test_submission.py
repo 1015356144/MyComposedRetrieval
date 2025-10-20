@@ -77,6 +77,10 @@ class CIRRSubmissionArguments:
         default=None,
         metadata={"help": "CIRR 图像根目录（包含 train/ dev/ test1/ 等子目录）"}
     )
+    resize_max_pixels: Optional[int] = field(
+        default=None,
+        metadata={"help": "在生成提交时使用的最大像素数（覆盖训练默认，留空则沿用训练配置）"}
+    )
 
 
 def _resolve_cirr_paths(evaluator: CIRREvaluator,
@@ -255,6 +259,8 @@ def main():
     # 构造默认的 ModelArguments 和 DataArguments，model_name 设为 auto-infer，后续由 eval_cirr 的逻辑自动推断
     model_args = ModelArguments(model_name="auto-infer")
     data_args = DataArguments()
+    if sub_args.resize_max_pixels is not None:
+        data_args.resize_max_pixels = sub_args.resize_max_pixels
 
     # 设置设备（支持分布式 torchrun 环境）
     device = eval_setup_device(sub_args.device, sub_args.distributed)

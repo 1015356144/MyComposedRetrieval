@@ -176,8 +176,9 @@ def infer_model_name_from_path(model_path: str, quiet: bool=False) -> str:
 
 def create_eval_config_if_needed(eval_args: CIRREvalArguments) -> str:
     """Return eval config path if provided, otherwise return None to use defaults"""
-    if eval_args.eval_config and os.path.exists(eval_args.eval_config):
-        return eval_args.eval_config
+    eval_config = getattr(eval_args, "eval_config", None)
+    if eval_config and os.path.exists(eval_config):
+        return eval_config
     
     # Don't create temporary config file, let evaluator use default values
     print_master("No eval config provided, will use default CIRR evaluation settings")
