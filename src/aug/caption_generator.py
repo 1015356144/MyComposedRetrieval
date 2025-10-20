@@ -214,6 +214,7 @@ class CaptionGenerator:
                         "reference_image": hard_neg["reference_image"],
                         "modification_text": gen_text,
                         "target_image": hard_neg.get("hard_negative_image", hard_neg.get("target_image")),
+                        "original_target_image": hard_neg.get("target_image"),
                         "original_mod_text": hard_neg["modification_text"],
                         "is_augmented": True,
                         "hard_negative_rank": hard_neg.get("rank_position"),
@@ -455,6 +456,9 @@ class CaptionGenerator:
 
         next_iter = self.iteration_round + 1
         out_file = os.path.join(self.experiment_dir, f"augmented_samples_iter_{next_iter}.json")
+        ref_images = {s.get("reference_image") for s in samples if s.get("reference_image")}
+        tgt_images = {s.get("target_image") for s in samples if s.get("target_image")}
+        orig_tgt_images = {s.get("original_target_image") for s in samples if s.get("original_target_image")}
         # 附带基础统计
         summary = {
             "total_samples": len(samples),
@@ -463,8 +467,9 @@ class CaptionGenerator:
             "sample_statistics": {
                 "avg_original_length": (sum(len(s.get("original_mod_text", "")) for s in samples) / len(samples)) if samples else 0,
                 "avg_generated_length": (sum(len(s.get("modification_text", "")) for s in samples) / len(samples)) if samples else 0,
-                "unique_reference_images": len(set(s.get("reference_image", "") for s in samples)),
-                "unique_target_images": len(set(s.get("target_image", "") for s in samples)),
+                "unique_reference_images": len(ref_images),
+                "unique_target_images": len(tgt_images),
+                "unique_original_target_images": len(orig_tgt_images),
             },
             "samples": samples
         }

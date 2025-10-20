@@ -1474,7 +1474,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         try:
             orig_chars, gen_chars = [], []
             orig_words, gen_words = [], []
-            refs, tgts, pairs = set(), set(), set()
+            refs, tgts, orig_tgts, pairs = set(), set(), set(), set()
 
             # optional counters
             has_original_cnt = 0
@@ -1499,8 +1499,10 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 # ----- unique images / pairs -----
                 ref = s.get("reference_image")
                 tgt = s.get("target_image")
+                orig_tgt = s.get("original_target_image")
                 if ref: refs.add(ref)
                 if tgt: tgts.add(tgt)
+                if orig_tgt: orig_tgts.add(orig_tgt)
                 if ref and tgt:
                     pairs.add((ref, tgt))
 
@@ -1527,6 +1529,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
                 "avg_generated_length": _mean(gen_chars),
                 "unique_reference_images": len(refs),
                 "unique_target_images": len(tgts),
+                "unique_original_target_images": len(orig_tgts),
                 "augmented_ratio": augmented_ratio,
 
                 # 新增更细致的指标
