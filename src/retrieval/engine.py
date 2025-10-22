@@ -37,12 +37,15 @@ class RetrievalEngine:
         model_args: Any,  # 用于拿 model_backbone
         retrieval_candidates: List[str],
         embedding_cache: Optional[EmbeddingCache] = None,
+        *,
+        topk: int = 10,
     ):
         self.experiment_dir = experiment_dir
         self.image_base_dir = image_base_dir
         self.model_args = model_args
         self.retrieval_candidates = retrieval_candidates
         self.cache = embedding_cache or EmbeddingCache(experiment_dir)
+        self.topk = max(int(topk), 1)
 
     # -------------------------- public API --------------------------
 
@@ -133,7 +136,7 @@ class RetrievalEngine:
         t_embs = F.normalize(target_embeddings, p=2, dim=1)
         sims = torch.mm(q_embs, t_embs.t())
 
-        k = min(10, len(candidate_targets))
+        k = min(self.topk, len(candidate_targets))
         top_k_sims, top_k_idx = torch.topk(sims, k, dim=1, largest=True)
 
         # GT 索引（fallback -1）
@@ -248,7 +251,7 @@ class RetrievalEngine:
         used_target_embeddings = used_target_embeddings.to(q_embs.dtype)
 
         sims = torch.mm(q_embs, used_target_embeddings.t())
-        k = min(10, len(candidate_targets))
+        k = min(self.topk, len(candidate_targets))
         top_k_sims, top_k_idx = torch.topk(sims, k, dim=1, largest=True)
 
         gt_indices = []

@@ -31,7 +31,6 @@ from src.retrieval.candidate_builder import CandidateBuilder
 from src.retrieval.embedding_cache import EmbeddingCache          
 from src.retrieval.engine import RetrievalEngine                 
 from src.aug.caption_generator import CaptionGenerator
-from src.prep.input_adapter import VLMInputPreparer
 
 # 各 backbone 的 prompt builder（若没配 LLaVA/Generic 会自动降级成 no-op）
 from src.prompt.qwen.builder import prepare_inputs as qwen_prepare, generate_with_qwen
@@ -1716,18 +1715,15 @@ class IterativeRetrievalTrainer(MMEBTrainer):
         backbone = getattr(self.model_args, "model_backbone", "qwen2_vl")
         device = f"cuda:{self.args.process_index}" if torch.cuda.is_available() else "cpu"
 
-        # ---------- 目标输入的前处理函数 ----------
-        prep = VLMInputPreparer(
-            image_base_dir=image_base_dir,
-            default_processor=proc,
-            default_backbone=backbone,
-            default_device=device,
-        )
-        prepare_fn = prep.prepare_target_inputs  # (paths, processor, backbone, device) -> inputs
-        print_master("Using VLMInputPreparer.prepare_target_inputs from src/prep/input_adapter.py")
-
         # fast/production 控制
         sample_limit = self.fast_mode_max_samples if getattr(self, "fast_mode", False) else None
+
+        dataset_config = getattr(ds, "dataset_config", {}) or {}
+        hard_neg_top_k = max(int(dataset_config.get("hard_neg_top_k", 10)), 1)
+        hard_neg_post_gt = max(int(dataset_config.get("hard_neg_post_gt", 0)), 0)
+        hard_neg_per_query = int(dataset_config.get("hard_neg_per_query", 5))
+        if hard_neg_per_query < 1:
+            hard_neg_per_query = 1
 
         # 1) 用数据集提供的基础信息构造三大模块
         candidate_builder = CandidateBuilder(
@@ -1753,6 +1749,7 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             experiment_dir=self.args.output_dir,
             image_base_dir=image_base_dir,
             retrieval_candidates=retrieval_candidates,
+            topk=hard_neg_top_k,
             # 可选：若 Engine 支持 fast 限制
             # fast_mode_limit=self.fast_mode_retrieval_db_size if self.fast_mode else None,
         )
@@ -1765,8 +1762,9 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             retrieval_engine=retrieval_engine,
             embedding_cache=embedding_cache,
             image_base_dir=image_base_dir,
-            max_negatives_per_query=5,
-            examine_topk=10,
+            max_negatives_per_query=hard_neg_per_query,
+            examine_topk=hard_neg_top_k,
+            post_gt_negatives=hard_neg_post_gt,
         )
 
         call_kwargs = dict(
@@ -1775,7 +1773,6 @@ class IterativeRetrievalTrainer(MMEBTrainer):
             processor=proc,
             model_backbone=backbone,
             device=device,
-            prepare_target_inputs_fn=prepare_fn,
         )
 
         # 3) 采集：分布式优先使用“最小改动版”

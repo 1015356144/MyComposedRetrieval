@@ -22,7 +22,8 @@ class HardNegativeMiner:
                  candidate_builder, retrieval_engine, embedding_cache,
                  image_base_dir: Optional[str] = None,
                  max_negatives_per_query: int = 5,
-                 examine_topk: int = 10):
+                 examine_topk: int = 10,
+                 post_gt_negatives: int = 0):
         self.image_base_dir = image_base_dir or ""
         self.max_negatives_per_query = max_negatives_per_query
         self.examine_topk = examine_topk
@@ -31,6 +32,7 @@ class HardNegativeMiner:
         self.candidate_builder = candidate_builder
         self.retrieval_engine = retrieval_engine
         self.embedding_cache = embedding_cache
+        self.post_gt_negatives = max(int(post_gt_negatives), 0)
 
         os.makedirs(self.experiment_dir, exist_ok=True)
         self.hard_negatives_cache = []
@@ -376,6 +378,14 @@ class HardNegativeMiner:
                 gt_position = top_k.index(gt_target)
                 if gt_position > 0:
                     for neg_pos in range(gt_position):
+                        if collected >= limit:
+                            break
+                        if process_negative_candidate(neg_pos, top_k[neg_pos], gt_position):
+                            collected += 1
+                if self.post_gt_negatives > 0 and collected < limit:
+                    post_start = gt_position + 1
+                    post_end = min(topN, post_start + self.post_gt_negatives)
+                    for neg_pos in range(post_start, post_end):
                         if collected >= limit:
                             break
                         if process_negative_candidate(neg_pos, top_k[neg_pos], gt_position):
